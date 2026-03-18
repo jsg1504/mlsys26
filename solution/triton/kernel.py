@@ -22,8 +22,6 @@ Parallelisation strategy:
   BLOCK_V is autotuned for optimal B200 occupancy (148 SMs).
 """
 
-import math
-
 import torch
 import triton
 import triton.language as tl
@@ -160,9 +158,6 @@ def kernel(q, k, v, state, A_log, a, dt_bias, b, scale, output, new_state):
     NUM_V_HEADS = 8
     HEAD_DIM = 128
     GVA_FACTOR = NUM_V_HEADS // NUM_Q_HEADS  # 2
-
-    if scale is None or scale == 0.0:
-        scale = 1.0 / math.sqrt(HEAD_DIM)
 
     # Handle optional state (None -> zeros)
     if state is None:

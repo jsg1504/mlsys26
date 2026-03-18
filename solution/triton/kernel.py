@@ -198,5 +198,5 @@ def kernel(q, k, v, state, A_log, a, dt_bias, b, scale, output, new_state):
         GVA_FACTOR=GVA_FACTOR,
         BLOCK_V=BLOCK_V,
         num_warps=4,
-        num_stages=1,
+        num_stages=2,
     )

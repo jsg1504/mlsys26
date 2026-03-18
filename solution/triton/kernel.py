@@ -39,7 +39,7 @@ import triton.language as tl
 # ---------------------------------------------------------------------------
 @triton.autotune(
     configs=[
-        triton.Config({"BLOCK_V": 2}, num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_V": 1}, num_warps=4, num_stages=2),
     ],
     key=["B"],
 )

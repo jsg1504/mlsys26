@@ -111,8 +111,8 @@ def _gdn_decode_kernel(
     k_offsets = tl.arange(0, HEAD_DIM)
     q_base = batch * NUM_Q_HEADS * HEAD_DIM + qk_head * HEAD_DIM
     k_base = batch * NUM_K_HEADS * HEAD_DIM + qk_head * HEAD_DIM
-    q_vals = tl.load(q_ptr + q_base + k_offsets, eviction_policy="evict_last").to(tl.float32)
-    k_vals = tl.load(k_ptr + k_base + k_offsets, eviction_policy="evict_last").to(tl.float32)
+    q_vals = tl.load(q_ptr + q_base + k_offsets).to(tl.float32)
+    k_vals = tl.load(k_ptr + k_base + k_offsets).to(tl.float32)
     qk_dot = tl.sum(q_vals * k_vals, axis=0)
 
     # ---- Load v values for this V-block [BLOCK_V] ----

@@ -41,17 +41,19 @@ import triton.language as tl
     configs=[
         triton.Config({"BLOCK_V": 2}, num_warps=1, num_stages=1),
         triton.Config({"BLOCK_V": 2}, num_warps=2, num_stages=1),
+        triton.Config({"BLOCK_V": 2}, num_warps=1, num_stages=2),
+        triton.Config({"BLOCK_V": 2}, num_warps=2, num_stages=2),
+        triton.Config({"BLOCK_V": 2}, num_warps=1, num_stages=3),
+        triton.Config({"BLOCK_V": 2}, num_warps=4, num_stages=1),
         triton.Config({"BLOCK_V": 4}, num_warps=1, num_stages=1),
         triton.Config({"BLOCK_V": 4}, num_warps=2, num_stages=1),
         triton.Config({"BLOCK_V": 4}, num_warps=4, num_stages=1),
         triton.Config({"BLOCK_V": 4}, num_warps=2, num_stages=2),
+        triton.Config({"BLOCK_V": 4}, num_warps=1, num_stages=2),
         triton.Config({"BLOCK_V": 8}, num_warps=2, num_stages=1),
         triton.Config({"BLOCK_V": 8}, num_warps=4, num_stages=1),
-        triton.Config({"BLOCK_V": 8}, num_warps=2, num_stages=2),
         triton.Config({"BLOCK_V": 16}, num_warps=4, num_stages=1),
-        triton.Config({"BLOCK_V": 16}, num_warps=4, num_stages=2),
         triton.Config({"BLOCK_V": 32}, num_warps=4, num_stages=1),
-        triton.Config({"BLOCK_V": 32}, num_warps=8, num_stages=1),
     ],
     key=["B"],
 )
@@ -127,7 +129,8 @@ def _gdn_decode_kernel(
     # state layout: [B, NUM_V_HEADS, HEAD_DIM(V), HEAD_DIM(K)] - K contiguous
     state_base = (batch * NUM_V_HEADS + v_head) * HEAD_DIM * HEAD_DIM
     state_offsets = v_offsets[:, None] * HEAD_DIM + k_offsets[None, :]
-    state_block = tl.load(state_ptr + state_base + state_offsets)
+    state_block = tl.load(state_ptr + state_base + state_offsets,
+                          eviction_policy="evict_first")
 
     # ---- Step 1: Decay ----
     state_block = g * state_block
@@ -153,7 +156,8 @@ def _gdn_decode_kernel(
 
     # ---- Store new state [BLOCK_V, HEAD_DIM] as f32 ----
     ns_base = (batch * NUM_V_HEADS + v_head) * HEAD_DIM * HEAD_DIM
-    tl.store(new_state_ptr + ns_base + state_offsets, state_block)
+    tl.store(new_state_ptr + ns_base + state_offsets, state_block,
+             eviction_policy="evict_first")
 
 
 def kernel(q, k, v, state, A_log, a, dt_bias, b, scale, output, new_state):

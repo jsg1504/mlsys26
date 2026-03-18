@@ -1,0 +1,3 @@
+[submodule "mlsys26-contest"]
+	path = mlsys26-contest
+	url = https://huggingface.co/datasets/flashinfer-ai/mlsys26-contest

@@ -81,8 +81,7 @@ def _gdn_decode_kernel(
     sp_x = tl.maximum(x, 0.0) + tl.math.log(1.0 + tl.math.exp(-tl.abs(x)))
     g = tl.math.exp(-tl.math.exp(A_log_val) * sp_x)
 
-    # beta = sigmoid(b)
-    beta = tl.sigmoid(b_val)
+    beta = 1.0 / (1.0 + tl.math.exp(-b_val))
 
     # ---- Load q, k vectors [HEAD_DIM] ----
     k_offsets = tl.arange(0, HEAD_DIM)

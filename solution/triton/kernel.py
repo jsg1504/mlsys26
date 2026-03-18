@@ -113,6 +113,7 @@ def _gdn_decode_kernel(
     k_base = batch * NUM_K_HEADS * HEAD_DIM + qk_head * HEAD_DIM
     q_vals = tl.load(q_ptr + q_base + k_offsets).to(tl.float32)
     k_vals = tl.load(k_ptr + k_base + k_offsets).to(tl.float32)
+    qk_dot = tl.sum(q_vals * k_vals, axis=0)
 
     # ---- Load v values for this V-block [BLOCK_V] ----
     v_offsets = v_start + tl.arange(0, BLOCK_V)
@@ -132,17 +133,18 @@ def _gdn_decode_kernel(
     # ---- Step 2: Retrieve from decayed state ----
     # old_v[v] = sum_k( k[k] * S_decayed[v, k] )
     old_v = tl.sum(state_block * k_vals[None, :], axis=1)
+    state_q = tl.sum(state_block * q_vals[None, :], axis=1)
 
     # ---- Step 3: Gated prediction error ----
     delta = beta * (v_vals - old_v)
 
     # ---- Step 4: Rank-1 update ----
     # S_new[v, k] = S_decayed[v, k] + k[k] * delta[v]
+    out_vals = scale * (state_q + delta * qk_dot)
     state_block = state_block + delta[:, None] * k_vals[None, :]
 
     # ---- Step 5: Query output ----
-    # out[v] = scale * sum_k( q[k] * S_new[v, k] )
-    out_vals = scale * tl.sum(state_block * q_vals[None, :], axis=1)
+    # out[v] = scale * (q . S_decayed + delta * (q . k))
 
     # ---- Store output [BLOCK_V] as bf16 ----
     out_base = batch * NUM_V_HEADS * HEAD_DIM + v_head * HEAD_DIM

@@ -46,8 +46,8 @@ import triton.language as tl
         triton.Config({"BLOCK_V": 2}, num_warps=4, num_stages=2),
         triton.Config({"BLOCK_V": 4}, num_warps=2, num_stages=2),
         triton.Config({"BLOCK_V": 4}, num_warps=4, num_stages=2),
-        triton.Config({"BLOCK_V": 8}, num_warps=2, num_stages=1),
-        triton.Config({"BLOCK_V": 8}, num_warps=4, num_stages=1),
+        triton.Config({"BLOCK_V": 8}, num_warps=2, num_stages=2),
+        triton.Config({"BLOCK_V": 8}, num_warps=4, num_stages=2),
     ],
     key=["B"],
 )

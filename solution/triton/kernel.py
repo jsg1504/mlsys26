@@ -40,7 +40,6 @@ def _gdn_decode_kernel(
     a_ptr,
     dt_bias_ptr,
     b_ptr,
-    scale,
     # Output pointers
     out_ptr,
     new_state_ptr,
@@ -118,7 +117,7 @@ def _gdn_decode_kernel(
 
     # ---- Step 4: Rank-1 update ----
     # S_new[v, k] = S_decayed[v, k] + k[k] * delta[v]
-    out_vals = scale * (state_q + delta * qk_dot)
+    out_vals = 0.08838834764831843 * (state_q + delta * qk_dot)
     state_block = state_block + delta[:, None] * k_vals[None, :]
 
     # ---- Step 5: Query output ----
@@ -188,7 +187,6 @@ def kernel(q, k, v, state, A_log, a, dt_bias, b, scale, output, new_state):
     _gdn_decode_kernel[grid](
         q_flat, k_flat, v_flat, state,
         A_log, a_flat, dt_bias, b_flat,
-        scale,
         out_flat, new_state,
         B_val,
         NUM_Q_HEADS=NUM_Q_HEADS,

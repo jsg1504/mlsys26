@@ -29,20 +29,6 @@ import triton
 import triton.language as tl
 
 
-# ---------------------------------------------------------------------------
-# Autotuning configs targeting B200 (148 SMs, 8 TB/s HBM3e)
-# For batch_size=1 with 8 v_heads:
-#   BLOCK_V=4  -> 256 programs  (good SM fill)
-#   BLOCK_V=8  -> 128 programs  (close to SM count)
-#   BLOCK_V=16 ->  64 programs  (under-filled, but less overhead)
-#   BLOCK_V=32 ->  32 programs  (large blocks)
-# ---------------------------------------------------------------------------
-@triton.autotune(
-    configs=[
-        triton.Config({"BLOCK_V": 1}, num_warps=4, num_stages=2),
-    ],
-    key=["B"],
-)
 @triton.jit
 def _gdn_decode_kernel(
     # Input pointers
@@ -196,8 +182,8 @@ def kernel(q, k, v, state, A_log, a, dt_bias, b, scale, output, new_state):
     b_flat = b.reshape(B_val, NUM_V_HEADS)
     out_flat = output.reshape(B_val, NUM_V_HEADS, HEAD_DIM)
 
-    # Grid: one program per (batch, v_head, v_block)
-    grid = lambda meta: (B_val * NUM_V_HEADS * (HEAD_DIM // meta["BLOCK_V"]),)
+    BLOCK_V = 1
+    grid = (B_val * NUM_V_HEADS * (HEAD_DIM // BLOCK_V),)
 
     _gdn_decode_kernel[grid](
         q_flat, k_flat, v_flat, state,
@@ -210,4 +196,7 @@ def kernel(q, k, v, state, A_log, a, dt_bias, b, scale, output, new_state):
         NUM_V_HEADS=NUM_V_HEADS,
         HEAD_DIM=HEAD_DIM,
         GVA_FACTOR=GVA_FACTOR,
+        BLOCK_V=BLOCK_V,
+        num_warps=4,
+        num_stages=2,
     )

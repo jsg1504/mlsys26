@@ -78,8 +78,8 @@ def _gdn_decode_kernel(
     # g = exp(-exp(A_log) * softplus(a + dt_bias))
     x = a_val + dt_bias_val
     # Branchless softplus: max(0,x) + log(1+exp(-|x|))
-    sp_x = tl.maximum(x, 0.0) + tl.log(1.0 + tl.exp(-tl.abs(x)))
-    g = tl.exp(-tl.exp(A_log_val) * sp_x)
+    sp_x = tl.maximum(x, 0.0) + tl.math.log(1.0 + tl.math.exp(-tl.abs(x)))
+    g = tl.math.exp(-tl.math.exp(A_log_val) * sp_x)
 
     # beta = sigmoid(b)
     beta = tl.sigmoid(b_val)

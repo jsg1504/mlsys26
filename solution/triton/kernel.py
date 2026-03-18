@@ -182,7 +182,7 @@ def kernel(q, k, v, state, A_log, a, dt_bias, b, scale, output, new_state):
     b_flat = b.reshape(B_val, NUM_V_HEADS)
     out_flat = output.reshape(B_val, NUM_V_HEADS, HEAD_DIM)
 
-    BLOCK_V = 1
+    BLOCK_V = 2
     grid = (B_val * NUM_V_HEADS * (HEAD_DIM // BLOCK_V),)
 
     _gdn_decode_kernel[grid](

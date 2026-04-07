@@ -35,6 +35,7 @@ constexpr int NUM_WARPS = HEAD_DIM / WARP_SIZE;
 constexpr int DEFAULT_STATE_TILE_ROWS = 16;
 constexpr int SMALL_STATE_TILE_ROWS = 8;
 constexpr int TINY_STATE_TILE_ROWS = 4;
+constexpr int MICRO_STATE_TILE_ROWS = 2;
 
 static_assert(HEAD_DIM % WARP_SIZE == 0, "HEAD_DIM must be warp aligned");
 
@@ -249,12 +250,31 @@ void gdn_prefill(
     bf16* output_ptr = static_cast<bf16*>(output.data_ptr());
     float* new_state_ptr = static_cast<float*>(new_state.data_ptr());
 
-    // Keep at least ~2 blocks per SM for the most synchronization-heavy launches.
+    // Keep the low-N path dense enough to hide CTA barriers, then fall back to the
+    // larger row tiles once the grid is no longer severely underfilled.
     const int default_grid_blocks =
         num_seqs * NUM_V_HEADS * (HEAD_DIM / DEFAULT_STATE_TILE_ROWS);
     const int small_grid_blocks =
         num_seqs * NUM_V_HEADS * (HEAD_DIM / SMALL_STATE_TILE_ROWS);
-    if (small_grid_blocks < (2 * sm_count)) {
+    const int tiny_grid_blocks =
+        num_seqs * NUM_V_HEADS * (HEAD_DIM / TINY_STATE_TILE_ROWS);
+    if (tiny_grid_blocks < (4 * sm_count)) {
+        launch_gdn_prefill_kernel<MICRO_STATE_TILE_ROWS>(
+            stream,
+            q_ptr,
+            k_ptr,
+            v_ptr,
+            state_ptr,
+            A_log_ptr,
+            a_ptr,
+            dt_bias_ptr,
+            b_gate_ptr,
+            cu_seqlens_ptr,
+            static_cast<float>(scale),
+            output_ptr,
+            new_state_ptr,
+            num_seqs);
+    } else if (small_grid_blocks < (2 * sm_count)) {
         launch_gdn_prefill_kernel<TINY_STATE_TILE_ROWS>(
             stream,
             q_ptr,

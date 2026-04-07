@@ -179,7 +179,7 @@ __global__ void gdn_prefill_kernel(
                     __float2bfloat16(scale * sum);
             }
         }
-        __syncthreads();
+        // The next timestep synchronizes before reusing shared scalars and row tiles.
     }
 
     // Write final state back

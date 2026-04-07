@@ -47,3 +47,10 @@ Tracking all optimization iterations for the prefill kernel.
 - Why: the latest Modal NCU profile still flagged the kernel as small-grid and synchronization-heavy, and NVIDIA's CUDA guidance says multiple resident blocks per SM help hide `__syncthreads()` stalls; moving the most underfilled shapes from `8` rows to `4` rows is the smallest change that increases block count again without touching the established `8`- and `16`-row paths.
 - Result: quick Modal benchmark passed all 100 workloads with `mean_speedup 102.1511` and `mean_latency_ms 3.33782` versus the latest comparable logged quick baseline `76.45` and `3.506`.
 - Decision: commit.
+
+## 2026-04-08 Iteration 11
+
+- Idea: remove the redundant end-of-timestep CTA barrier after the output write in the recurrent loop.
+- Why: the required Modal NCU profile still showed low achieved occupancy across the workload mix (`6.18%` to `18.86%`) and Nsight continued to flag the kernel as underfilled and `__syncthreads()`-sensitive; after the output-reduction barrier, only `tid == 0` performs a global output store, while the next timestep already has a barrier before any thread reuses shared scalars or row tiles, so the trailing barrier was extra synchronization.
+- Result: quick Modal benchmark passed all 100 workloads with `mean_speedup 105.33746` and `mean_latency_ms 3.25857` versus the latest comparable logged quick baseline `102.1511` and `3.33782`.
+- Decision: commit.

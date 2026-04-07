@@ -21,7 +21,7 @@ TRACE_SET_PATH = "/data"
 
 image = (
     modal.Image.from_registry(
-        "nvidia/cuda:12.8.1-devel-ubuntu22.04",
+        "nvidia/cuda:13.2.0-devel-ubuntu22.04",
         add_python="3.12",
     )
     .pip_install("flashinfer-bench", "torch", "triton", "numpy")

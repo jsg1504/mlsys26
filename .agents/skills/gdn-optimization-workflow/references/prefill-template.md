@@ -14,9 +14,11 @@
 
 ```text
 Read `gdn_prefill_qk4_v8_d128_k_last/solution/cuda/kernel.cu`, `logs/prefill/bench_history.jsonl`, and `logs/prefill/optimization_log.md`.
+Also read any relevant materials under `docs/` before ranking ideas.
+Actively consult relevant official documentation and papers if they help validate bottlenecks or improve the proposed optimization.
 Treat the latest comparable quick benchmark entry as baseline.
 Identify the most likely current bottleneck in the prefill kernel and rank 2-3 next optimization ideas for a single iteration.
-Return the top recommendation, expected impact, implementation sketch, and any correctness constraints.
+Return the top recommendation, expected impact, implementation sketch, any correctness constraints, which `docs/` files informed the recommendation, and which official documents or papers materially influenced it.
 ```
 
 ## Worker Message: Implement
@@ -42,5 +44,6 @@ Return pass or fail, findings by severity, and whether benchmarking is safe.
 Run the quick Modal benchmark for prefill:
 `conda run -n fi-bench modal run scripts/run_modal_subfolder.py --subfolder gdn_prefill_qk4_v8_d128_k_last`
 Parse the benchmark output, append a new entry to `logs/prefill/bench_history.jsonl`, compare it against the latest comparable quick benchmark baseline already in that log, and recommend `revert` or `commit`.
+The appended JSON line must include `decision` with that final recommendation.
 Use correctness regression or no performance improvement as `revert`.
 ```

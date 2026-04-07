@@ -25,6 +25,7 @@ Run the quick Modal benchmark for the target kernel, append the result to the co
    - correctness metrics
    - workload count
 3. Append a new JSON line to the kernel-specific `bench_history.jsonl`.
+   - Include the final workflow recommendation in that JSON object as `decision`, with value `commit` or `revert`.
 4. Compare the new entry against the latest comparable existing quick benchmark entry in that same log.
 5. Recommend `revert` or `commit`.
 
@@ -33,6 +34,7 @@ Run the quick Modal benchmark for the target kernel, append the result to the co
 - Recommend `revert` if correctness regressed.
 - Recommend `revert` if performance did not improve over baseline.
 - Recommend `commit` only if correctness is preserved and performance improved.
+- The appended benchmark-history entry should use that same final recommendation as its `decision` field.
 
 ## Output
 
@@ -40,3 +42,4 @@ Run the quick Modal benchmark for the target kernel, append the result to the co
 - Baseline entry used for comparison
 - Delta vs baseline
 - Final recommendation: `revert` or `commit`
+- Exact JSONL entry appended, including `decision`

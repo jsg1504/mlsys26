@@ -106,6 +106,7 @@ __global__ void gdn_prefill_kernel(
         // Step 1: k @ temp for each vi
         for (int vi = 0; vi < HEAD_DIM; vi++) {
             float temp_val = g * s_state[vi * HEAD_DIM + tid];
+            s_state[vi * HEAD_DIM + tid] = temp_val;
             float partial = k_val * temp_val;
 
             for (int offset = 16; offset > 0; offset >>= 1)
@@ -124,7 +125,7 @@ __global__ void gdn_prefill_kernel(
         // Steps 2-4: update state and compute output
         for (int vi = 0; vi < HEAD_DIM; vi++) {
             float residual = beta * (s_v[vi] - s_kdot[vi]);
-            float new_s = g * s_state[vi * HEAD_DIM + tid] + k_val * residual;
+            float new_s = s_state[vi * HEAD_DIM + tid] + k_val * residual;
             s_state[vi * HEAD_DIM + tid] = new_s;
 
             float partial = q_val * new_s;

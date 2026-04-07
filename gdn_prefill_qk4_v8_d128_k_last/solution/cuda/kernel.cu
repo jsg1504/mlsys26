@@ -30,6 +30,12 @@ constexpr int NUM_K_HEADS = 4;
 constexpr int NUM_V_HEADS = 8;
 constexpr int HEAD_DIM = 128;
 constexpr int V_PER_Q = NUM_V_HEADS / NUM_Q_HEADS;  // 2
+constexpr int WARP_SIZE = 32;
+constexpr int NUM_WARPS = HEAD_DIM / WARP_SIZE;
+constexpr int ROW_TILE = 8;
+
+static_assert(HEAD_DIM % WARP_SIZE == 0, "HEAD_DIM must be warp aligned");
+static_assert(HEAD_DIM % ROW_TILE == 0, "HEAD_DIM must be divisible by ROW_TILE");
 
 __device__ __forceinline__ float softplus(float x) {
     return log1pf(expf(x));
@@ -60,6 +66,8 @@ __global__ void gdn_prefill_kernel(
     const int vh = idx % NUM_V_HEADS;
     const int qkh = vh / V_PER_Q;
     const int tid = threadIdx.x;
+    const int lane = tid & (WARP_SIZE - 1);
+    const int warp_idx = tid / WARP_SIZE;
 
     if (seq >= num_seqs) return;
 
@@ -73,14 +81,14 @@ __global__ void gdn_prefill_kernel(
 
     // Dynamic shared memory layout:
     // [0, HEAD_DIM*HEAD_DIM): s_state [V][K] = 64KB
-    // [HEAD_DIM*HEAD_DIM, +4): s_reduce (4 floats)
-    // [+4, +4+HEAD_DIM): s_kdot (128 floats)
-    // [+4+HEAD_DIM, +4+2*HEAD_DIM): s_v (128 floats)
+    // [HEAD_DIM*HEAD_DIM, +NUM_WARPS*ROW_TILE): s_reduce
+    // [+NUM_WARPS*ROW_TILE, +NUM_WARPS*ROW_TILE+ROW_TILE): s_kdot_tile
+    // [+..., +HEAD_DIM): s_v
     extern __shared__ float smem[];
     float* s_state = smem;
     float* s_reduce = smem + HEAD_DIM * HEAD_DIM;
-    float* s_kdot = s_reduce + 4;
-    float* s_v = s_kdot + HEAD_DIM;
+    float* s_kdot_tile = s_reduce + NUM_WARPS * ROW_TILE;
+    float* s_v = s_kdot_tile + ROW_TILE;
 
     for (int vi = 0; vi < HEAD_DIM; vi++) {
         s_state[vi * HEAD_DIM + tid] = state_base[vi * HEAD_DIM + tid];
@@ -103,43 +111,63 @@ __global__ void gdn_prefill_kernel(
         s_v[tid] = v_val;
         __syncthreads();
 
-        // Step 1: k @ temp for each vi
-        for (int vi = 0; vi < HEAD_DIM; vi++) {
-            float temp_val = g * s_state[vi * HEAD_DIM + tid];
-            s_state[vi * HEAD_DIM + tid] = temp_val;
-            float partial = k_val * temp_val;
+        for (int vi_base = 0; vi_base < HEAD_DIM; vi_base += ROW_TILE) {
+            #pragma unroll
+            for (int r = 0; r < ROW_TILE; r++) {
+                const int vi = vi_base + r;
+                float temp_val = g * s_state[vi * HEAD_DIM + tid];
+                s_state[vi * HEAD_DIM + tid] = temp_val;
+                float partial = k_val * temp_val;
 
-            for (int offset = 16; offset > 0; offset >>= 1)
-                partial += __shfl_down_sync(0xffffffff, partial, offset);
+                for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1)
+                    partial += __shfl_down_sync(0xffffffff, partial, offset);
 
-            if (tid % 32 == 0)
-                s_reduce[tid / 32] = partial;
-            __syncthreads();
-
-            if (tid == 0) {
-                s_kdot[vi] = s_reduce[0] + s_reduce[1] + s_reduce[2] + s_reduce[3];
+                if (lane == 0)
+                    s_reduce[warp_idx * ROW_TILE + r] = partial;
             }
             __syncthreads();
-        }
 
-        // Steps 2-4: update state and compute output
-        for (int vi = 0; vi < HEAD_DIM; vi++) {
-            float residual = beta * (s_v[vi] - s_kdot[vi]);
-            float new_s = s_state[vi * HEAD_DIM + tid] + k_val * residual;
-            s_state[vi * HEAD_DIM + tid] = new_s;
+            if (tid == 0) {
+                #pragma unroll
+                for (int r = 0; r < ROW_TILE; r++) {
+                    float sum = 0.0f;
+                    #pragma unroll
+                    for (int warp = 0; warp < NUM_WARPS; warp++) {
+                        sum += s_reduce[warp * ROW_TILE + r];
+                    }
+                    s_kdot_tile[r] = sum;
+                }
+            }
+            __syncthreads();
 
-            float partial = q_val * new_s;
-            for (int offset = 16; offset > 0; offset >>= 1)
-                partial += __shfl_down_sync(0xffffffff, partial, offset);
+            #pragma unroll
+            for (int r = 0; r < ROW_TILE; r++) {
+                const int vi = vi_base + r;
+                float residual = beta * (s_v[vi] - s_kdot_tile[r]);
+                float new_s = s_state[vi * HEAD_DIM + tid] + k_val * residual;
+                s_state[vi * HEAD_DIM + tid] = new_s;
 
-            if (tid % 32 == 0)
-                s_reduce[tid / 32] = partial;
+                float partial = q_val * new_s;
+                for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1)
+                    partial += __shfl_down_sync(0xffffffff, partial, offset);
+
+                if (lane == 0)
+                    s_reduce[warp_idx * ROW_TILE + r] = partial;
+            }
             __syncthreads();
 
             if (tid == 0) {
-                float sum = s_reduce[0] + s_reduce[1] + s_reduce[2] + s_reduce[3];
-                output[t * NUM_V_HEADS * HEAD_DIM + vh * HEAD_DIM + vi] =
-                    __float2bfloat16(scale * sum);
+                #pragma unroll
+                for (int r = 0; r < ROW_TILE; r++) {
+                    const int vi = vi_base + r;
+                    float sum = 0.0f;
+                    #pragma unroll
+                    for (int warp = 0; warp < NUM_WARPS; warp++) {
+                        sum += s_reduce[warp * ROW_TILE + r];
+                    }
+                    output[t * NUM_V_HEADS * HEAD_DIM + vh * HEAD_DIM + vi] =
+                        __float2bfloat16(scale * sum);
+                }
             }
             __syncthreads();
         }
@@ -175,8 +203,10 @@ void gdn_prefill(
     dim3 grid(num_seqs * NUM_V_HEADS);
     dim3 block(HEAD_DIM);
 
-    // Dynamic shared memory: state[128*128] + reduce[4] + kdot[128] + v[128]
-    const int smem_bytes = (HEAD_DIM * HEAD_DIM + 4 + HEAD_DIM + HEAD_DIM) * sizeof(float);
+    // Dynamic shared memory: state[128*128] + reduce[NUM_WARPS*ROW_TILE] +
+    // kdot_tile[ROW_TILE] + v[128]
+    const int smem_bytes =
+        (HEAD_DIM * HEAD_DIM + NUM_WARPS * ROW_TILE + ROW_TILE + HEAD_DIM) * sizeof(float);
     cudaFuncSetAttribute(gdn_prefill_kernel,
         cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
 

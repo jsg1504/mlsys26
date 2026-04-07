@@ -32,18 +32,18 @@ constexpr int HEAD_DIM = 128;
 constexpr int V_PER_Q = NUM_V_HEADS / NUM_Q_HEADS;  // 2
 constexpr int WARP_SIZE = 32;
 constexpr int NUM_WARPS = HEAD_DIM / WARP_SIZE;
-constexpr int ROW_TILE = 8;
+constexpr int STATE_TILE_ROWS = 16;
 
 static_assert(HEAD_DIM % WARP_SIZE == 0, "HEAD_DIM must be warp aligned");
-static_assert(HEAD_DIM % ROW_TILE == 0, "HEAD_DIM must be divisible by ROW_TILE");
+static_assert(HEAD_DIM % STATE_TILE_ROWS == 0, "HEAD_DIM must be divisible by STATE_TILE_ROWS");
 
 __device__ __forceinline__ float softplus(float x) {
     return log1pf(expf(x));
 }
 
 /*
- * One block per (seq_idx, v_head) pair.
- * Grid: (num_seqs * NUM_V_HEADS,)
+ * One block per (seq_idx, v_head, state_row_tile) triple.
+ * Grid: (num_seqs * NUM_V_HEADS, HEAD_DIM / STATE_TILE_ROWS)
  * Block: (128,) — one thread per K dimension
  */
 __global__ void gdn_prefill_kernel(
@@ -62,12 +62,14 @@ __global__ void gdn_prefill_kernel(
     int num_seqs
 ) {
     const int idx = blockIdx.x;
+    const int row_tile = blockIdx.y;
     const int seq = idx / NUM_V_HEADS;
     const int vh = idx % NUM_V_HEADS;
     const int qkh = vh / V_PER_Q;
     const int tid = threadIdx.x;
     const int lane = tid & (WARP_SIZE - 1);
     const int warp_idx = tid / WARP_SIZE;
+    const int vi_base = row_tile * STATE_TILE_ROWS;
 
     if (seq >= num_seqs) return;
 
@@ -79,19 +81,15 @@ __global__ void gdn_prefill_kernel(
     const float* state_base = state + (seq * NUM_V_HEADS + vh) * HEAD_DIM * HEAD_DIM;
     float* new_state_base = new_state + (seq * NUM_V_HEADS + vh) * HEAD_DIM * HEAD_DIM;
 
-    // Dynamic shared memory layout:
-    // [0, HEAD_DIM*HEAD_DIM): s_state [V][K] = 64KB
-    // [HEAD_DIM*HEAD_DIM, +NUM_WARPS*ROW_TILE): s_reduce
-    // [+NUM_WARPS*ROW_TILE, +NUM_WARPS*ROW_TILE+ROW_TILE): s_kdot_tile
-    // [+..., +HEAD_DIM): s_v
-    extern __shared__ float smem[];
-    float* s_state = smem;
-    float* s_reduce = smem + HEAD_DIM * HEAD_DIM;
-    float* s_kdot_tile = s_reduce + NUM_WARPS * ROW_TILE;
-    float* s_v = s_kdot_tile + ROW_TILE;
+    __shared__ float s_state[STATE_TILE_ROWS][HEAD_DIM];
+    __shared__ float s_reduce[NUM_WARPS][STATE_TILE_ROWS];
+    __shared__ float s_kdot_tile[STATE_TILE_ROWS];
+    __shared__ float s_v_tile[STATE_TILE_ROWS];
 
-    for (int vi = 0; vi < HEAD_DIM; vi++) {
-        s_state[vi * HEAD_DIM + tid] = state_base[vi * HEAD_DIM + tid];
+    #pragma unroll
+    for (int r = 0; r < STATE_TILE_ROWS; r++) {
+        const int vi = vi_base + r;
+        s_state[r][tid] = state_base[vi * HEAD_DIM + tid];
     }
     __syncthreads();
 
@@ -107,75 +105,76 @@ __global__ void gdn_prefill_kernel(
 
         float k_val = __bfloat162float(k[t * NUM_K_HEADS * HEAD_DIM + qkh * HEAD_DIM + tid]);
         float q_val = __bfloat162float(q[t * NUM_Q_HEADS * HEAD_DIM + qkh * HEAD_DIM + tid]);
-        float v_val = __bfloat162float(v[t * NUM_V_HEADS * HEAD_DIM + vh * HEAD_DIM + tid]);
-        s_v[tid] = v_val;
+        if (tid < STATE_TILE_ROWS) {
+            s_v_tile[tid] = __bfloat162float(
+                v[t * NUM_V_HEADS * HEAD_DIM + vh * HEAD_DIM + vi_base + tid]);
+        }
         __syncthreads();
 
-        for (int vi_base = 0; vi_base < HEAD_DIM; vi_base += ROW_TILE) {
-            #pragma unroll
-            for (int r = 0; r < ROW_TILE; r++) {
-                const int vi = vi_base + r;
-                float temp_val = g * s_state[vi * HEAD_DIM + tid];
-                s_state[vi * HEAD_DIM + tid] = temp_val;
-                float partial = k_val * temp_val;
+        #pragma unroll
+        for (int r = 0; r < STATE_TILE_ROWS; r++) {
+            float temp_val = g * s_state[r][tid];
+            s_state[r][tid] = temp_val;
+            float partial = k_val * temp_val;
 
-                for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1)
-                    partial += __shfl_down_sync(0xffffffff, partial, offset);
+            for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1)
+                partial += __shfl_down_sync(0xffffffff, partial, offset);
 
-                if (lane == 0)
-                    s_reduce[warp_idx * ROW_TILE + r] = partial;
-            }
-            __syncthreads();
-
-            if (tid == 0) {
-                #pragma unroll
-                for (int r = 0; r < ROW_TILE; r++) {
-                    float sum = 0.0f;
-                    #pragma unroll
-                    for (int warp = 0; warp < NUM_WARPS; warp++) {
-                        sum += s_reduce[warp * ROW_TILE + r];
-                    }
-                    s_kdot_tile[r] = sum;
-                }
-            }
-            __syncthreads();
-
-            #pragma unroll
-            for (int r = 0; r < ROW_TILE; r++) {
-                const int vi = vi_base + r;
-                float residual = beta * (s_v[vi] - s_kdot_tile[r]);
-                float new_s = s_state[vi * HEAD_DIM + tid] + k_val * residual;
-                s_state[vi * HEAD_DIM + tid] = new_s;
-
-                float partial = q_val * new_s;
-                for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1)
-                    partial += __shfl_down_sync(0xffffffff, partial, offset);
-
-                if (lane == 0)
-                    s_reduce[warp_idx * ROW_TILE + r] = partial;
-            }
-            __syncthreads();
-
-            if (tid == 0) {
-                #pragma unroll
-                for (int r = 0; r < ROW_TILE; r++) {
-                    const int vi = vi_base + r;
-                    float sum = 0.0f;
-                    #pragma unroll
-                    for (int warp = 0; warp < NUM_WARPS; warp++) {
-                        sum += s_reduce[warp * ROW_TILE + r];
-                    }
-                    output[t * NUM_V_HEADS * HEAD_DIM + vh * HEAD_DIM + vi] =
-                        __float2bfloat16(scale * sum);
-                }
-            }
-            __syncthreads();
+            if (lane == 0)
+                s_reduce[warp_idx][r] = partial;
         }
+        __syncthreads();
+
+        if (tid == 0) {
+            #pragma unroll
+            for (int r = 0; r < STATE_TILE_ROWS; r++) {
+                float sum = 0.0f;
+                #pragma unroll
+                for (int warp = 0; warp < NUM_WARPS; warp++) {
+                    sum += s_reduce[warp][r];
+                }
+                s_kdot_tile[r] = sum;
+            }
+        }
+        __syncthreads();
+
+        #pragma unroll
+        for (int r = 0; r < STATE_TILE_ROWS; r++) {
+            const int vi = vi_base + r;
+            float residual = beta * (s_v_tile[r] - s_kdot_tile[r]);
+            float new_s = s_state[r][tid] + k_val * residual;
+            s_state[r][tid] = new_s;
+
+            float partial = q_val * new_s;
+            for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1)
+                partial += __shfl_down_sync(0xffffffff, partial, offset);
+
+            if (lane == 0)
+                s_reduce[warp_idx][r] = partial;
+        }
+        __syncthreads();
+
+        if (tid == 0) {
+            #pragma unroll
+            for (int r = 0; r < STATE_TILE_ROWS; r++) {
+                const int vi = vi_base + r;
+                float sum = 0.0f;
+                #pragma unroll
+                for (int warp = 0; warp < NUM_WARPS; warp++) {
+                    sum += s_reduce[warp][r];
+                }
+                output[t * NUM_V_HEADS * HEAD_DIM + vh * HEAD_DIM + vi] =
+                    __float2bfloat16(scale * sum);
+            }
+        }
+        __syncthreads();
     }
 
     // Write final state back
-    for (int vi = 0; vi < HEAD_DIM; vi++) {
-        new_state_base[vi * HEAD_DIM + tid] = s_state[vi * HEAD_DIM + tid];
+    #pragma unroll
+    for (int r = 0; r < STATE_TILE_ROWS; r++) {
+        const int vi = vi_base + r;
+        new_state_base[vi * HEAD_DIM + tid] = s_state[r][tid];
     }
 }
 
@@ -200,17 +199,10 @@ void gdn_prefill(
     cudaStream_t stream = static_cast<cudaStream_t>(
         TVMFFIEnvGetStream(dev.device_type, dev.device_id));
 
-    dim3 grid(num_seqs * NUM_V_HEADS);
+    dim3 grid(num_seqs * NUM_V_HEADS, HEAD_DIM / STATE_TILE_ROWS);
     dim3 block(HEAD_DIM);
 
-    // Dynamic shared memory: state[128*128] + reduce[NUM_WARPS*ROW_TILE] +
-    // kdot_tile[ROW_TILE] + v[128]
-    const int smem_bytes =
-        (HEAD_DIM * HEAD_DIM + NUM_WARPS * ROW_TILE + ROW_TILE + HEAD_DIM) * sizeof(float);
-    cudaFuncSetAttribute(gdn_prefill_kernel,
-        cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes);
-
-    gdn_prefill_kernel<<<grid, block, smem_bytes, stream>>>(
+    gdn_prefill_kernel<<<grid, block, 0, stream>>>(
         static_cast<const bf16*>(q.data_ptr()),
         static_cast<const bf16*>(k.data_ptr()),
         static_cast<const bf16*>(v.data_ptr()),

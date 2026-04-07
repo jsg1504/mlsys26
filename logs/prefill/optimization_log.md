@@ -33,3 +33,10 @@ Tracking all optimization iterations for the prefill kernel.
 - Why: after the row-tiled rewrite, the inner loop still duplicated the `softplus`/`exp`/sigmoid chain and the `a`/`b` loads across every thread in the CTA even though those scalars are identical for a given `(t, vh)` tile.
 - Result: quick Modal benchmark passed all 100 workloads with `mean_speedup 63.84` and `mean_latency_ms 3.854` versus the latest comparable logged quick baseline `61.32` and `3.598`.
 - Decision: commit.
+
+## 2026-04-08 Iteration 5
+
+- Idea: specialize underfilled launches to `8`-row tiles when the default `16`-row prefill grid would launch fewer than one block per SM.
+- Why: the corrected Modal NCU profile showed that low-parallelism shapes still launched only `64` blocks at `N=1` with the `16`-row kernel and reached about `6.2%` achieved occupancy, while large shapes were already near-balanced, so the best next single change was to increase short-case block count without disturbing the main `16`-row path.
+- Result: quick Modal benchmark passed all 100 workloads with `mean_speedup 76.45` and `mean_latency_ms 3.506` versus the latest comparable logged quick baseline `63.84` and `3.854`.
+- Decision: commit.

@@ -32,10 +32,10 @@ constexpr int HEAD_DIM = 128;
 constexpr int V_PER_Q = NUM_V_HEADS / NUM_Q_HEADS;  // 2
 constexpr int WARP_SIZE = 32;
 constexpr int NUM_WARPS = HEAD_DIM / WARP_SIZE;
-constexpr int STATE_TILE_ROWS = 16;
+constexpr int DEFAULT_STATE_TILE_ROWS = 16;
+constexpr int SMALL_STATE_TILE_ROWS = 8;
 
 static_assert(HEAD_DIM % WARP_SIZE == 0, "HEAD_DIM must be warp aligned");
-static_assert(HEAD_DIM % STATE_TILE_ROWS == 0, "HEAD_DIM must be divisible by STATE_TILE_ROWS");
 
 __device__ __forceinline__ float softplus(float x) {
     return log1pf(expf(x));
@@ -46,6 +46,7 @@ __device__ __forceinline__ float softplus(float x) {
  * Grid: (num_seqs * NUM_V_HEADS, HEAD_DIM / STATE_TILE_ROWS)
  * Block: (128,) — one thread per K dimension
  */
+template <int STATE_TILE_ROWS>
 __global__ void gdn_prefill_kernel(
     const bf16* __restrict__ q,         // [T, 4, 128]
     const bf16* __restrict__ k,         // [T, 4, 128]
@@ -61,6 +62,8 @@ __global__ void gdn_prefill_kernel(
     float* __restrict__ new_state,      // [N, 8, 128, 128]
     int num_seqs
 ) {
+    static_assert(HEAD_DIM % STATE_TILE_ROWS == 0,
+                  "HEAD_DIM must be divisible by STATE_TILE_ROWS");
     const int idx = blockIdx.x;
     const int row_tile = blockIdx.y;
     const int seq = idx / NUM_V_HEADS;
@@ -186,6 +189,29 @@ __global__ void gdn_prefill_kernel(
     }
 }
 
+template <int STATE_TILE_ROWS>
+void launch_gdn_prefill_kernel(
+    cudaStream_t stream,
+    const bf16* q,
+    const bf16* k,
+    const bf16* v,
+    const float* state,
+    const float* A_log,
+    const bf16* a,
+    const float* dt_bias,
+    const bf16* b_gate,
+    const int64_t* cu_seqlens,
+    float scale,
+    bf16* output,
+    float* new_state,
+    int num_seqs
+) {
+    dim3 grid(num_seqs * NUM_V_HEADS, HEAD_DIM / STATE_TILE_ROWS);
+    dim3 block(HEAD_DIM);
+    gdn_prefill_kernel<STATE_TILE_ROWS><<<grid, block, 0, stream>>>(
+        q, k, v, state, A_log, a, dt_bias, b_gate, cu_seqlens, scale, output, new_state, num_seqs);
+}
+
 // TVM FFI entry point (DPS style)
 void gdn_prefill(
     tvm::ffi::TensorView q,         // [T, 4, 128] bf16
@@ -207,24 +233,57 @@ void gdn_prefill(
     cudaStream_t stream = static_cast<cudaStream_t>(
         TVMFFIEnvGetStream(dev.device_type, dev.device_id));
 
-    dim3 grid(num_seqs * NUM_V_HEADS, HEAD_DIM / STATE_TILE_ROWS);
-    dim3 block(HEAD_DIM);
+    int sm_count = 0;
+    cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, dev.device_id);
 
-    gdn_prefill_kernel<<<grid, block, 0, stream>>>(
-        static_cast<const bf16*>(q.data_ptr()),
-        static_cast<const bf16*>(k.data_ptr()),
-        static_cast<const bf16*>(v.data_ptr()),
-        static_cast<const float*>(state.data_ptr()),
-        static_cast<const float*>(A_log.data_ptr()),
-        static_cast<const bf16*>(a.data_ptr()),
-        static_cast<const float*>(dt_bias.data_ptr()),
-        static_cast<const bf16*>(b_gate.data_ptr()),
-        static_cast<const int64_t*>(cu_seqlens.data_ptr()),
-        static_cast<float>(scale),
-        static_cast<bf16*>(output.data_ptr()),
-        static_cast<float*>(new_state.data_ptr()),
-        num_seqs
-    );
+    const bf16* q_ptr = static_cast<const bf16*>(q.data_ptr());
+    const bf16* k_ptr = static_cast<const bf16*>(k.data_ptr());
+    const bf16* v_ptr = static_cast<const bf16*>(v.data_ptr());
+    const float* state_ptr = static_cast<const float*>(state.data_ptr());
+    const float* A_log_ptr = static_cast<const float*>(A_log.data_ptr());
+    const bf16* a_ptr = static_cast<const bf16*>(a.data_ptr());
+    const float* dt_bias_ptr = static_cast<const float*>(dt_bias.data_ptr());
+    const bf16* b_gate_ptr = static_cast<const bf16*>(b_gate.data_ptr());
+    const int64_t* cu_seqlens_ptr = static_cast<const int64_t*>(cu_seqlens.data_ptr());
+    bf16* output_ptr = static_cast<bf16*>(output.data_ptr());
+    float* new_state_ptr = static_cast<float*>(new_state.data_ptr());
+
+    // Use finer row tiles only when the default launch would underfill the GPU.
+    const int default_grid_blocks =
+        num_seqs * NUM_V_HEADS * (HEAD_DIM / DEFAULT_STATE_TILE_ROWS);
+    if (default_grid_blocks < sm_count) {
+        launch_gdn_prefill_kernel<SMALL_STATE_TILE_ROWS>(
+            stream,
+            q_ptr,
+            k_ptr,
+            v_ptr,
+            state_ptr,
+            A_log_ptr,
+            a_ptr,
+            dt_bias_ptr,
+            b_gate_ptr,
+            cu_seqlens_ptr,
+            static_cast<float>(scale),
+            output_ptr,
+            new_state_ptr,
+            num_seqs);
+    } else {
+        launch_gdn_prefill_kernel<DEFAULT_STATE_TILE_ROWS>(
+            stream,
+            q_ptr,
+            k_ptr,
+            v_ptr,
+            state_ptr,
+            A_log_ptr,
+            a_ptr,
+            dt_bias_ptr,
+            b_gate_ptr,
+            cu_seqlens_ptr,
+            static_cast<float>(scale),
+            output_ptr,
+            new_state_ptr,
+            num_seqs);
+    }
 }
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(kernel, gdn_prefill);

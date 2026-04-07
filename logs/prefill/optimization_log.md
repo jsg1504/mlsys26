@@ -40,3 +40,10 @@ Tracking all optimization iterations for the prefill kernel.
 - Why: the corrected Modal NCU profile showed that low-parallelism shapes still launched only `64` blocks at `N=1` with the `16`-row kernel and reached about `6.2%` achieved occupancy, while large shapes were already near-balanced, so the best next single change was to increase short-case block count without disturbing the main `16`-row path.
 - Result: quick Modal benchmark passed all 100 workloads with `mean_speedup 76.45` and `mean_latency_ms 3.506` versus the latest comparable logged quick baseline `63.84` and `3.854`.
 - Decision: commit.
+
+## 2026-04-08 Iteration 6
+
+- Idea: add a `4`-row tile fallback when the existing `8`-row prefill launch would still expose fewer than roughly two blocks per SM.
+- Why: the latest Modal NCU profile still flagged the kernel as small-grid and synchronization-heavy, and NVIDIA's CUDA guidance says multiple resident blocks per SM help hide `__syncthreads()` stalls; moving the most underfilled shapes from `8` rows to `4` rows is the smallest change that increases block count again without touching the established `8`- and `16`-row paths.
+- Result: quick Modal benchmark passed all 100 workloads with `mean_speedup 102.1511` and `mean_latency_ms 3.33782` versus the latest comparable logged quick baseline `76.45` and `3.506`.
+- Decision: commit.

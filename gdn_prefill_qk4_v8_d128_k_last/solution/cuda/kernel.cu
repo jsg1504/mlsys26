@@ -85,6 +85,8 @@ __global__ void gdn_prefill_kernel(
     __shared__ float s_reduce[NUM_WARPS][STATE_TILE_ROWS];
     __shared__ float s_kdot_tile[STATE_TILE_ROWS];
     __shared__ float s_v_tile[STATE_TILE_ROWS];
+    __shared__ float s_g;
+    __shared__ float s_beta;
 
     #pragma unroll
     for (int r = 0; r < STATE_TILE_ROWS; r++) {
@@ -93,18 +95,24 @@ __global__ void gdn_prefill_kernel(
     }
     __syncthreads();
 
-    float A_val = A_log[vh];
-    float dt_val = dt_bias[vh];
+    float A_exp = 0.0f;
+    float dt_val = 0.0f;
+    if (tid == 0) {
+        A_exp = expf(A_log[vh]);
+        dt_val = dt_bias[vh];
+    }
 
     for (int t_offset = 0; t_offset < seq_len; t_offset++) {
         int t = (int)seq_start + t_offset;
 
-        float a_val = __bfloat162float(a[t * NUM_V_HEADS + vh]);
-        float g = expf(-expf(A_val) * softplus(a_val + dt_val));
-        float beta = 1.0f / (1.0f + expf(-__bfloat162float(b_gate[t * NUM_V_HEADS + vh])));
-
         float k_val = __bfloat162float(k[t * NUM_K_HEADS * HEAD_DIM + qkh * HEAD_DIM + tid]);
         float q_val = __bfloat162float(q[t * NUM_Q_HEADS * HEAD_DIM + qkh * HEAD_DIM + tid]);
+        if (tid == 0) {
+            float a_val = __bfloat162float(a[t * NUM_V_HEADS + vh]);
+            float b_val = __bfloat162float(b_gate[t * NUM_V_HEADS + vh]);
+            s_g = expf(-A_exp * softplus(a_val + dt_val));
+            s_beta = 1.0f / (1.0f + expf(-b_val));
+        }
         if (tid < STATE_TILE_ROWS) {
             s_v_tile[tid] = __bfloat162float(
                 v[t * NUM_V_HEADS * HEAD_DIM + vh * HEAD_DIM + vi_base + tid]);
@@ -113,7 +121,7 @@ __global__ void gdn_prefill_kernel(
 
         #pragma unroll
         for (int r = 0; r < STATE_TILE_ROWS; r++) {
-            float temp_val = g * s_state[r][tid];
+            float temp_val = s_g * s_state[r][tid];
             s_state[r][tid] = temp_val;
             float partial = k_val * temp_val;
 
@@ -141,7 +149,7 @@ __global__ void gdn_prefill_kernel(
         #pragma unroll
         for (int r = 0; r < STATE_TILE_ROWS; r++) {
             const int vi = vi_base + r;
-            float residual = beta * (s_v_tile[r] - s_kdot_tile[r]);
+            float residual = s_beta * (s_v_tile[r] - s_kdot_tile[r]);
             float new_s = s_state[r][tid] + k_val * residual;
             s_state[r][tid] = new_s;
 

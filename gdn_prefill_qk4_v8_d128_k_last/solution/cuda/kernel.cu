@@ -36,6 +36,8 @@ constexpr int DEFAULT_STATE_TILE_ROWS = 16;
 constexpr int SMALL_STATE_TILE_ROWS = 8;
 constexpr int TINY_STATE_TILE_ROWS = 4;
 constexpr int MICRO_STATE_TILE_ROWS = 2;
+constexpr int MICRO_BLOCK_THREADS = 64;
+constexpr int MICRO_K_COLS_PER_LANE = HEAD_DIM / WARP_SIZE;
 
 static_assert(HEAD_DIM % WARP_SIZE == 0, "HEAD_DIM must be warp aligned");
 
@@ -191,6 +193,130 @@ __global__ void gdn_prefill_kernel(
     }
 }
 
+/*
+ * Specialized micro-tile kernel for the live 2-row path.
+ * Each warp owns one row and reduces across its 128 K columns with four values per lane,
+ * eliminating the cross-warp row reductions and CTA barriers inside the timestep loop.
+ */
+__global__ void gdn_prefill_kernel_micro(
+    const bf16* __restrict__ q,         // [T, 4, 128]
+    const bf16* __restrict__ k,         // [T, 4, 128]
+    const bf16* __restrict__ v,         // [T, 8, 128]
+    const float* __restrict__ state,    // [N, 8, 128, 128] k-last
+    const float* __restrict__ A_log,    // [8]
+    const bf16* __restrict__ a,         // [T, 8]
+    const float* __restrict__ dt_bias,  // [8]
+    const bf16* __restrict__ b_gate,    // [T, 8]
+    const int64_t* __restrict__ cu_seqlens, // [N+1]
+    const float scale,
+    bf16* __restrict__ output,          // [T, 8, 128]
+    float* __restrict__ new_state,      // [N, 8, 128, 128]
+    int num_seqs
+) {
+    static_assert(MICRO_STATE_TILE_ROWS == 2, "Micro kernel assumes 2-row tiles");
+    static_assert(MICRO_K_COLS_PER_LANE == 4, "Micro kernel assumes four K columns per lane");
+
+    const int idx = blockIdx.x;
+    const int row_tile = blockIdx.y;
+    const int seq = idx / NUM_V_HEADS;
+    const int vh = idx % NUM_V_HEADS;
+    const int qkh = vh / V_PER_Q;
+    const int tid = threadIdx.x;
+    const int warp_idx = tid / WARP_SIZE;
+    const int lane = tid & (WARP_SIZE - 1);
+    const int vi = row_tile * MICRO_STATE_TILE_ROWS + warp_idx;
+    const int k_col_base = lane * MICRO_K_COLS_PER_LANE;
+    constexpr unsigned int kWarpMask = 0xffffffffu;
+
+    if (seq >= num_seqs || warp_idx >= MICRO_STATE_TILE_ROWS) return;
+
+    const int64_t seq_start = cu_seqlens[seq];
+    const int64_t seq_end = cu_seqlens[seq + 1];
+    const int seq_len = (int)(seq_end - seq_start);
+    if (seq_len <= 0) return;
+
+    const float* state_row =
+        state + ((seq * NUM_V_HEADS + vh) * HEAD_DIM + vi) * HEAD_DIM;
+    float* new_state_row =
+        new_state + ((seq * NUM_V_HEADS + vh) * HEAD_DIM + vi) * HEAD_DIM;
+
+    float state_vals[MICRO_K_COLS_PER_LANE];
+    #pragma unroll
+    for (int c = 0; c < MICRO_K_COLS_PER_LANE; c++) {
+        state_vals[c] = state_row[k_col_base + c];
+    }
+
+    float A_exp = 0.0f;
+    float dt_val = 0.0f;
+    if (lane == 0) {
+        A_exp = expf(A_log[vh]);
+        dt_val = dt_bias[vh];
+    }
+    A_exp = __shfl_sync(kWarpMask, A_exp, 0);
+    dt_val = __shfl_sync(kWarpMask, dt_val, 0);
+
+    for (int t_offset = 0; t_offset < seq_len; t_offset++) {
+        const int t = (int)seq_start + t_offset;
+        const int qk_base = t * NUM_K_HEADS * HEAD_DIM + qkh * HEAD_DIM + k_col_base;
+        const int q_base = t * NUM_Q_HEADS * HEAD_DIM + qkh * HEAD_DIM + k_col_base;
+
+        float g = 0.0f;
+        float beta = 0.0f;
+        if (lane == 0) {
+            const float a_val = __bfloat162float(a[t * NUM_V_HEADS + vh]);
+            const float b_val = __bfloat162float(b_gate[t * NUM_V_HEADS + vh]);
+            g = expf(-A_exp * softplus(a_val + dt_val));
+            beta = 1.0f / (1.0f + expf(-b_val));
+        }
+        g = __shfl_sync(kWarpMask, g, 0);
+        beta = __shfl_sync(kWarpMask, beta, 0);
+
+        float k_vals[MICRO_K_COLS_PER_LANE];
+        float q_vals[MICRO_K_COLS_PER_LANE];
+        float kdot_partial = 0.0f;
+        #pragma unroll
+        for (int c = 0; c < MICRO_K_COLS_PER_LANE; c++) {
+            k_vals[c] = __bfloat162float(k[qk_base + c]);
+            q_vals[c] = __bfloat162float(q[q_base + c]);
+            state_vals[c] *= g;
+            kdot_partial += k_vals[c] * state_vals[c];
+        }
+
+        for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+            kdot_partial += __shfl_down_sync(kWarpMask, kdot_partial, offset);
+        }
+
+        float residual = 0.0f;
+        if (lane == 0) {
+            const float v_val =
+                __bfloat162float(v[t * NUM_V_HEADS * HEAD_DIM + vh * HEAD_DIM + vi]);
+            residual = beta * (v_val - kdot_partial);
+        }
+        residual = __shfl_sync(kWarpMask, residual, 0);
+
+        float output_partial = 0.0f;
+        #pragma unroll
+        for (int c = 0; c < MICRO_K_COLS_PER_LANE; c++) {
+            state_vals[c] += k_vals[c] * residual;
+            output_partial += q_vals[c] * state_vals[c];
+        }
+
+        for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+            output_partial += __shfl_down_sync(kWarpMask, output_partial, offset);
+        }
+
+        if (lane == 0) {
+            output[t * NUM_V_HEADS * HEAD_DIM + vh * HEAD_DIM + vi] =
+                __float2bfloat16(scale * output_partial);
+        }
+    }
+
+    #pragma unroll
+    for (int c = 0; c < MICRO_K_COLS_PER_LANE; c++) {
+        new_state_row[k_col_base + c] = state_vals[c];
+    }
+}
+
 template <int STATE_TILE_ROWS>
 void launch_gdn_prefill_kernel(
     cudaStream_t stream,
@@ -211,6 +337,28 @@ void launch_gdn_prefill_kernel(
     dim3 grid(num_seqs * NUM_V_HEADS, HEAD_DIM / STATE_TILE_ROWS);
     dim3 block(HEAD_DIM);
     gdn_prefill_kernel<STATE_TILE_ROWS><<<grid, block, 0, stream>>>(
+        q, k, v, state, A_log, a, dt_bias, b_gate, cu_seqlens, scale, output, new_state, num_seqs);
+}
+
+void launch_gdn_prefill_kernel_micro(
+    cudaStream_t stream,
+    const bf16* q,
+    const bf16* k,
+    const bf16* v,
+    const float* state,
+    const float* A_log,
+    const bf16* a,
+    const float* dt_bias,
+    const bf16* b_gate,
+    const int64_t* cu_seqlens,
+    float scale,
+    bf16* output,
+    float* new_state,
+    int num_seqs
+) {
+    dim3 grid(num_seqs * NUM_V_HEADS, HEAD_DIM / MICRO_STATE_TILE_ROWS);
+    dim3 block(MICRO_BLOCK_THREADS);
+    gdn_prefill_kernel_micro<<<grid, block, 0, stream>>>(
         q, k, v, state, A_log, a, dt_bias, b_gate, cu_seqlens, scale, output, new_state, num_seqs);
 }
 
@@ -259,7 +407,7 @@ void gdn_prefill(
     const int tiny_grid_blocks =
         num_seqs * NUM_V_HEADS * (HEAD_DIM / TINY_STATE_TILE_ROWS);
     if (tiny_grid_blocks < (4 * sm_count)) {
-        launch_gdn_prefill_kernel<MICRO_STATE_TILE_ROWS>(
+        launch_gdn_prefill_kernel_micro(
             stream,
             q_ptr,
             k_ptr,

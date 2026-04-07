@@ -10,12 +10,13 @@ For GDN kernel optimization work, use the project-local skill:
 Apply this loop:
 1. Read the current decode or prefill kernel.
 2. Read the latest comparable quick benchmark entry from the kernel-specific history log.
-3. Research the next high-impact optimization.
-4. Implement one optimization only.
-5. Review the edited kernel before benchmarking.
-6. Run the quick Modal benchmark and log the result.
-7. Revert if correctness regressed or speedup did not improve.
-8. Commit only if correctness is preserved and performance improved.
+3. Profile the current kernel on Modal before researching optimizations.
+4. Research the next high-impact optimization.
+5. Implement one optimization only.
+6. Review the edited kernel before benchmarking.
+7. Run the quick Modal benchmark and log the result.
+8. Revert if correctness regressed or speedup did not improve.
+9. Commit only if correctness is preserved and performance improved.
 
 ## Project Facts
 

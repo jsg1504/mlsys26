@@ -17,19 +17,23 @@ Use this skill for the two project kernels:
 2. Read the matching optimization log:
    - `logs/decode/optimization_log.md`
    - `logs/prefill/optimization_log.md`
-3. Research the next optimization candidate.
+3. Profile the current kernel on Modal before optimization research:
+   - `conda run -n fi-bench modal run scripts/profile_kernel.py --kernel <decode|prefill>`
+   - Use the profile to identify the current launch, occupancy, memory, and synchronization bottlenecks.
+4. Research the next optimization candidate.
    - During research, read relevant documents under `docs/` first when they apply to the target kernel or optimization topic.
    - Then actively consult relevant official documentation and papers when they can sharpen the bottleneck analysis or proposed optimization.
-4. Choose exactly one idea for the iteration.
-5. Implement only that one idea.
-6. Review the edited kernel before benchmarking.
-7. Run the quick Modal benchmark:
+   - Ground the recommendation in the latest profile findings, not code inspection alone.
+5. Choose exactly one idea for the iteration.
+6. Implement only that one idea.
+7. Review the edited kernel before benchmarking.
+8. Run the quick Modal benchmark:
    - `conda run -n fi-bench modal run scripts/run_modal_subfolder.py --subfolder <subfolder>`
-8. Append the benchmark result to the correct kernel log.
+9. Append the benchmark result to the correct kernel log.
    - Include the final workflow decision in the JSONL entry as `decision: "commit"` or `decision: "revert"` for optimization iterations.
-9. Compare against the latest comparable quick benchmark baseline.
-10. Revert if correctness regressed or performance did not improve.
-11. Commit only if correctness is preserved and performance improved.
+10. Compare against the latest comparable quick benchmark baseline.
+11. Revert if correctness regressed or performance did not improve.
+12. Commit only if correctness is preserved and performance improved.
 
 ## Hard Rules
 
@@ -37,9 +41,11 @@ Use this skill for the two project kernels:
 - No full benchmark in this workflow.
 - No unrelated cleanup mixed into the experiment.
 - Baseline comes from the latest comparable logged quick benchmark result, not memory.
+- Profile the current kernel before researching the next optimization idea.
 - Correctness regression always loses to speed.
 - Research subagents should consult relevant `docs/` materials before proposing new optimization ideas.
 - Research subagents should actively use relevant official documentation and papers, not just local notes, when evaluating optimization ideas.
+- Research recommendations should cite the current profile findings that motivated the idea.
 - Optimization-iteration entries appended to `bench_history.jsonl` should include a `decision` field with `commit` or `revert`.
 
 ## Delegation

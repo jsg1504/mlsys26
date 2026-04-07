@@ -7,6 +7,8 @@
 - Config: `gdn_decode_qk4_v8_d128_k_last/config.toml`
 - Bench log: `logs/decode/bench_history.jsonl`
 - Optimization log: `logs/decode/optimization_log.md`
+- Profile command:
+  - `conda run -n fi-bench modal run scripts/profile_kernel.py --kernel decode`
 - Benchmark command:
   - `conda run -n fi-bench modal run scripts/run_modal_subfolder.py --subfolder gdn_decode_qk4_v8_d128_k_last`
 
@@ -14,9 +16,12 @@
 
 ```text
 Read `gdn_decode_qk4_v8_d128_k_last/solution/cuda/kernel.cu`, `logs/decode/bench_history.jsonl`, and `logs/decode/optimization_log.md`.
+Before ranking ideas, run:
+`conda run -n fi-bench modal run scripts/profile_kernel.py --kernel decode`
 Also read any relevant materials under `docs/` before ranking ideas.
 Actively consult relevant official documentation and papers if they help validate bottlenecks or improve the proposed optimization.
 Treat the latest comparable quick benchmark entry as baseline.
+Use the current profile results to identify the dominant bottlenecks and cite the relevant profile findings.
 Identify the most likely current bottleneck in the decode kernel and rank 2-3 next optimization ideas for a single iteration.
 Return the top recommendation, expected impact, implementation sketch, any correctness constraints, which `docs/` files informed the recommendation, and which official documents or papers materially influenced it.
 ```

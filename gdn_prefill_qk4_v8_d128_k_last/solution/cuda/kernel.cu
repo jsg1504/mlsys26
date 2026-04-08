@@ -241,18 +241,21 @@ __global__ void gdn_prefill_kernel_long(
     const float* state_base = state + (seq * NUM_V_HEADS + vh) * HEAD_DIM * HEAD_DIM;
     float* new_state_base = new_state + (seq * NUM_V_HEADS + vh) * HEAD_DIM * HEAD_DIM;
 
-    __shared__ float s_state[DEFAULT_STATE_TILE_ROWS][HEAD_DIM];
     __shared__ float s_q[HEAD_DIM];
     __shared__ float s_k[HEAD_DIM];
     __shared__ float s_g;
     __shared__ float s_beta;
 
+    float state_vals[LONG_ROWS_PER_WARP][MICRO_K_COLS_PER_LANE];
     #pragma unroll
-    for (int r = 0; r < DEFAULT_STATE_TILE_ROWS; r++) {
+    for (int group = 0; group < LONG_ROWS_PER_WARP; group++) {
+        const int r = warp_idx + group * NUM_WARPS;
         const int vi = vi_base + r;
-        s_state[r][tid] = state_base[vi * HEAD_DIM + tid];
+        #pragma unroll
+        for (int c = 0; c < MICRO_K_COLS_PER_LANE; c++) {
+            state_vals[group][c] = state_base[vi * HEAD_DIM + k_col_base + c];
+        }
     }
-    __syncthreads();
 
     float A_exp = 0.0f;
     float dt_val = 0.0f;
@@ -283,14 +286,13 @@ __global__ void gdn_prefill_kernel_long(
         for (int group = 0; group < LONG_ROWS_PER_WARP; group++) {
             const int r = warp_idx + group * NUM_WARPS;
             const int vi = vi_base + r;
-            float state_vals[MICRO_K_COLS_PER_LANE];
             float kdot_partial = 0.0f;
 
             #pragma unroll
             for (int c = 0; c < MICRO_K_COLS_PER_LANE; c++) {
                 const int col = k_col_base + c;
-                const float temp_val = s_g * s_state[r][col];
-                state_vals[c] = temp_val;
+                const float temp_val = s_g * state_vals[group][c];
+                state_vals[group][c] = temp_val;
                 kdot_partial += s_k[col] * temp_val;
             }
 
@@ -310,9 +312,8 @@ __global__ void gdn_prefill_kernel_long(
             #pragma unroll
             for (int c = 0; c < MICRO_K_COLS_PER_LANE; c++) {
                 const int col = k_col_base + c;
-                const float new_s = state_vals[c] + s_k[col] * residual;
-                s_state[r][col] = new_s;
-                output_partial += s_q[col] * new_s;
+                state_vals[group][c] += s_k[col] * residual;
+                output_partial += s_q[col] * state_vals[group][c];
             }
 
             for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
@@ -326,12 +327,14 @@ __global__ void gdn_prefill_kernel_long(
         }
     }
 
-    __syncthreads();
-
     #pragma unroll
-    for (int r = 0; r < DEFAULT_STATE_TILE_ROWS; r++) {
+    for (int group = 0; group < LONG_ROWS_PER_WARP; group++) {
+        const int r = warp_idx + group * NUM_WARPS;
         const int vi = vi_base + r;
-        new_state_base[vi * HEAD_DIM + tid] = s_state[r][tid];
+        #pragma unroll
+        for (int c = 0; c < MICRO_K_COLS_PER_LANE; c++) {
+            new_state_base[vi * HEAD_DIM + k_col_base + c] = state_vals[group][c];
+        }
     }
 }
 

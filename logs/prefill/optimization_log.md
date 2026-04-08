@@ -236,3 +236,31 @@ Tracking all optimization iterations for the prefill kernel.
 - Why: the required Modal profile still showed the templated prefill kernels were latency-hiding limited and synchronization-sensitive, while the refreshed local prefill study had already ruled out more launch heuristics, micro-path vectorization, register-only tiling, and gate precompute as low-ROI or regressing directions. The remaining live structural weakness was the `16`-row long path, which still reduced each row twice across all four warps and serialized the final accumulation through one thread even though the Iteration 29 micro kernel had already shown that warp-local ownership is the right mapping for this recurrence.
 - Result: the quick Modal benchmark passed all `100/100` workloads with `mean_speedup 228.64867`, `mean_latency_ms 1.24849`, `min_speedup 84.47675`, and `max_speedup 534.08526` versus the latest comparable logged quick baseline `mean_speedup 170.18544` and `mean_latency_ms 3.05327`.
 - Decision: commit because correctness held and the weighted `mean_speedup` improved strongly versus the latest comparable quick baseline.
+
+## 2026-04-08 Iteration 34
+
+- Idea: cache each lane's staged `q/k` slice from shared memory into registers once per timestep in the live `16`-row long-path kernel, then reuse it across that warp's four owned rows.
+- Why: the required Modal profile still pointed to low achieved occupancy and weak latency hiding on representative prefill shapes, and the profiling harness still skewed toward older underfilled launch regimes; in the live long-path kernel, each warp nevertheless reread the same four staged `q/k` values from shared memory for every one of its four row groups. Register-caching that per-lane slice was the narrowest way to cut repeated shared-memory traffic without changing the row mapping, dispatch, or recurrence math.
+- Result: the quick Modal benchmark passed all `100/100` workloads with `mean_speedup 207.62804`, `mean_latency_ms 1.20821`, `min_speedup 79.43320`, and `max_speedup 512.53244` versus the latest comparable logged quick baseline `mean_speedup 228.64867` and `mean_latency_ms 1.24849`.
+- Decision: revert because correctness held, but the weighted `mean_speedup` regressed versus the latest comparable quick baseline.
+
+## 2026-04-08 Iteration 35
+
+- Idea: relayout the live `16`-row long-path prefill kernel's staged `q`, `k`, and `state` shared-memory columns into a packed `[4][32]` form so each warp's `4`-columns-per-lane accesses avoid the current stride-4 bank-conflict pattern.
+- Why: the required Modal profile still showed the prefill kernel family was latency-hiding limited and small-grid overall, while the current long path repeatedly reuses shared `q/k` slices and a shared `16 x 128` state tile with that `4`-columns-per-lane access pattern. NVIDIA's CUDA Best Practices Guide notes that bank conflicts serialize shared-memory accesses, so after the register-caching follow-up regressed, the narrowest remaining long-path experiment was to keep the row mapping and math unchanged but repack the hot shared-memory layout to match the warp's lane ownership.
+- Result: the quick Modal benchmark passed all `100/100` workloads with `mean_speedup 204.94450`, `mean_latency_ms 1.24249`, `min_speedup 57.75807`, and `max_speedup 501.44085` versus the latest comparable logged quick baseline `mean_speedup 228.64867` and `mean_latency_ms 1.24849`.
+- Decision: revert because correctness held but the weighted `mean_speedup` regressed versus the latest comparable quick baseline.
+
+## 2026-04-08 Iteration 36
+
+- Idea: pair the sibling `v_head`s in the live `16`-row long-path prefill kernel so one CTA stages the shared `q/k` slice once per `q/k` head and reuses it across both value heads, but only when the halved long-path grid still leaves roughly two blocks per SM.
+- Why: the required Modal profile still showed the prefill kernel family was latency-hiding limited and grid-small, while the local prefill study identified grouped-value attention as the main remaining reuse opportunity inside the current kernel family because two value heads share one `q/k` head. After the recent long-path register-caching and bank-conflict follow-ups both regressed, the narrowest untried current-code experiment was to exploit that sibling-head reuse only on well-filled long-path launches instead of perturbing the dominant low-`N` micro path.
+- Result: the quick Modal benchmark passed all `100/100` workloads with `mean_speedup 227.13710`, `mean_latency_ms 1.33915`, `min_speedup 71.52`, and `max_speedup 533.10` versus the latest comparable logged quick baseline `mean_speedup 228.64867` and `mean_latency_ms 1.24849`.
+- Decision: revert because correctness held but the weighted `mean_speedup` regressed versus the latest comparable quick baseline.
+
+## 2026-04-08 Iteration 37
+
+- Idea: keep the live `16`-row long-path prefill kernel's warp-owned state rows in registers for the full recurrent loop instead of shared memory, while preserving the existing `q/k` shared staging and warp-local reductions.
+- Why: the required Modal profile still showed the prefill kernel family was grid-small and latency-hiding limited, with low achieved occupancy and low compute/memory throughput across the representative quick-profile shapes; after Iteration 33 proved the long path benefits from warp-owned row groups, the remaining untried long-path fixed-overhead target was the shared-memory round-trip on those already warp-private state rows. NVIDIA's CUDA guidance also treats registers as thread-local storage, so moving each lane's `4 x 4` long-path state fragment into registers was the narrowest safe way to cut that shared-state traffic without changing the math, dispatch, or `q/k` staging pattern.
+- Result: the quick Modal benchmark passed all `100/100` workloads with `mean_speedup 263.85762`, `mean_latency_ms 0.95621`, `min_speedup 88.22610`, and `max_speedup 792.56230` versus the latest comparable logged quick baseline `mean_speedup 228.64867` and `mean_latency_ms 1.24849`.
+- Decision: commit because correctness held and the weighted `mean_speedup` improved versus the latest comparable quick baseline.

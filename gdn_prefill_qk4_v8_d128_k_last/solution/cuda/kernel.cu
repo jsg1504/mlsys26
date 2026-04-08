@@ -48,6 +48,57 @@ __device__ __forceinline__ float softplus(float x) {
     return log1pf(expf(x));
 }
 
+static inline void set_persisting_l2_window(
+    cudaStream_t stream,
+    int device_id,
+    const void* base_ptr,
+    size_t total_bytes
+) {
+    if (base_ptr == nullptr || total_bytes == 0) return;
+
+    cudaDeviceProp prop{};
+    cudaGetDeviceProperties(&prop, device_id);
+    if (prop.persistingL2CacheMaxSize <= 0 || prop.accessPolicyMaxWindowSize <= 0) return;
+
+    size_t set_aside_bytes = (static_cast<size_t>(prop.l2CacheSize) * 3) / 4;
+    const size_t max_persisting_bytes = static_cast<size_t>(prop.persistingL2CacheMaxSize);
+    if (set_aside_bytes > max_persisting_bytes) {
+        set_aside_bytes = max_persisting_bytes;
+    }
+    if (set_aside_bytes == 0) return;
+
+    cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize, set_aside_bytes);
+
+    size_t window_bytes = total_bytes;
+    const size_t max_window_bytes = static_cast<size_t>(prop.accessPolicyMaxWindowSize);
+    if (window_bytes > max_window_bytes) {
+        window_bytes = max_window_bytes;
+    }
+
+    float hit_ratio = 1.0f;
+    if (window_bytes > set_aside_bytes) {
+        hit_ratio = static_cast<float>(set_aside_bytes) / static_cast<float>(window_bytes);
+    }
+
+    cudaStreamAttrValue stream_attr{};
+    stream_attr.accessPolicyWindow.base_ptr = const_cast<void*>(base_ptr);
+    stream_attr.accessPolicyWindow.num_bytes = window_bytes;
+    stream_attr.accessPolicyWindow.hitRatio = hit_ratio;
+    stream_attr.accessPolicyWindow.hitProp = cudaAccessPropertyPersisting;
+    stream_attr.accessPolicyWindow.missProp = cudaAccessPropertyStreaming;
+    cudaStreamSetAttribute(stream, cudaStreamAttributeAccessPolicyWindow, &stream_attr);
+}
+
+static inline void clear_persisting_l2_window(cudaStream_t stream) {
+    cudaStreamAttrValue stream_attr{};
+    stream_attr.accessPolicyWindow.base_ptr = nullptr;
+    stream_attr.accessPolicyWindow.num_bytes = 0;
+    stream_attr.accessPolicyWindow.hitRatio = 0.0f;
+    stream_attr.accessPolicyWindow.hitProp = cudaAccessPropertyNormal;
+    stream_attr.accessPolicyWindow.missProp = cudaAccessPropertyNormal;
+    cudaStreamSetAttribute(stream, cudaStreamAttributeAccessPolicyWindow, &stream_attr);
+}
+
 /*
  * One block per (seq_idx, v_head, state_row_tile) triple.
  * Grid: (num_seqs * NUM_V_HEADS, HEAD_DIM / STATE_TILE_ROWS)
@@ -565,6 +616,8 @@ void gdn_prefill(
     const int64_t* cu_seqlens_ptr = static_cast<const int64_t*>(cu_seqlens.data_ptr());
     bf16* output_ptr = static_cast<bf16*>(output.data_ptr());
     float* new_state_ptr = static_cast<float*>(new_state.data_ptr());
+    const size_t total_k_bytes =
+        static_cast<size_t>(k.size(0)) * NUM_K_HEADS * HEAD_DIM * sizeof(bf16);
 
     // Keep the low-N path dense enough to hide CTA barriers, then fall back to the
     // larger row tiles once the grid is no longer severely underfilled.
@@ -623,6 +676,7 @@ void gdn_prefill(
             new_state_ptr,
             num_seqs);
     } else {
+        set_persisting_l2_window(stream, dev.device_id, k_ptr, total_k_bytes);
         launch_gdn_prefill_kernel_long(
             stream,
             q_ptr,
@@ -638,6 +692,7 @@ void gdn_prefill(
             output_ptr,
             new_state_ptr,
             num_seqs);
+        clear_persisting_l2_window(stream);
     }
 }
 

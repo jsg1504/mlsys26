@@ -628,6 +628,9 @@ void gdn_prefill(
     const int tiny_grid_blocks =
         num_seqs * NUM_V_HEADS * (HEAD_DIM / TINY_STATE_TILE_ROWS);
     if (tiny_grid_blocks < (4 * sm_count)) {
+        // The micro path rereads the same k stream across 64 row tiles, and its
+        // low-N working sets fit comfortably inside the persisting-L2 budget.
+        set_persisting_l2_window(stream, dev.device_id, k_ptr, total_k_bytes);
         launch_gdn_prefill_kernel_micro(
             stream,
             q_ptr,
@@ -643,6 +646,7 @@ void gdn_prefill(
             output_ptr,
             new_state_ptr,
             num_seqs);
+        clear_persisting_l2_window(stream);
     } else if (small_grid_blocks < (2 * sm_count)) {
         launch_gdn_prefill_kernel<TINY_STATE_TILE_ROWS>(
             stream,

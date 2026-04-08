@@ -241,11 +241,6 @@ __global__ void gdn_prefill_kernel_long(
     const float* state_base = state + (seq * NUM_V_HEADS + vh) * HEAD_DIM * HEAD_DIM;
     float* new_state_base = new_state + (seq * NUM_V_HEADS + vh) * HEAD_DIM * HEAD_DIM;
 
-    __shared__ float s_q[HEAD_DIM];
-    __shared__ float s_k[HEAD_DIM];
-    __shared__ float s_g;
-    __shared__ float s_beta;
-
     float state_vals[LONG_ROWS_PER_WARP][MICRO_K_COLS_PER_LANE];
     #pragma unroll
     for (int group = 0; group < LONG_ROWS_PER_WARP; group++) {
@@ -259,28 +254,36 @@ __global__ void gdn_prefill_kernel_long(
 
     float A_exp = 0.0f;
     float dt_val = 0.0f;
-    if (tid == 0) {
+    if (lane == 0) {
         A_exp = expf(A_log[vh]);
         dt_val = dt_bias[vh];
     }
+    A_exp = __shfl_sync(kWarpMask, A_exp, 0);
+    dt_val = __shfl_sync(kWarpMask, dt_val, 0);
 
     for (int t_offset = 0; t_offset < seq_len; t_offset++) {
-        if (t_offset > 0) {
-            __syncthreads();
-        }
-
         const int t = (int)seq_start + t_offset;
         const int qk_base = t * NUM_K_HEADS * HEAD_DIM + qkh * HEAD_DIM;
         const int q_base = t * NUM_Q_HEADS * HEAD_DIM + qkh * HEAD_DIM;
-        s_k[tid] = __bfloat162float(k[qk_base + tid]);
-        s_q[tid] = __bfloat162float(q[q_base + tid]);
-        if (tid == 0) {
+        float g = 0.0f;
+        float beta = 0.0f;
+        if (lane == 0) {
             const float a_val = __bfloat162float(a[t * NUM_V_HEADS + vh]);
             const float b_val = __bfloat162float(b_gate[t * NUM_V_HEADS + vh]);
-            s_g = expf(-A_exp * softplus(a_val + dt_val));
-            s_beta = 1.0f / (1.0f + expf(-b_val));
+            g = expf(-A_exp * softplus(a_val + dt_val));
+            beta = 1.0f / (1.0f + expf(-b_val));
         }
-        __syncthreads();
+        g = __shfl_sync(kWarpMask, g, 0);
+        beta = __shfl_sync(kWarpMask, beta, 0);
+
+        float k_vals[MICRO_K_COLS_PER_LANE];
+        float q_vals[MICRO_K_COLS_PER_LANE];
+        #pragma unroll
+        for (int c = 0; c < MICRO_K_COLS_PER_LANE; c++) {
+            const int col = k_col_base + c;
+            k_vals[c] = __bfloat162float(k[qk_base + col]);
+            q_vals[c] = __bfloat162float(q[q_base + col]);
+        }
 
         #pragma unroll
         for (int group = 0; group < LONG_ROWS_PER_WARP; group++) {
@@ -290,10 +293,9 @@ __global__ void gdn_prefill_kernel_long(
 
             #pragma unroll
             for (int c = 0; c < MICRO_K_COLS_PER_LANE; c++) {
-                const int col = k_col_base + c;
-                const float temp_val = s_g * state_vals[group][c];
+                const float temp_val = g * state_vals[group][c];
                 state_vals[group][c] = temp_val;
-                kdot_partial += s_k[col] * temp_val;
+                kdot_partial += k_vals[c] * temp_val;
             }
 
             for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
@@ -304,16 +306,15 @@ __global__ void gdn_prefill_kernel_long(
             if (lane == 0) {
                 const float v_val =
                     __bfloat162float(v[t * NUM_V_HEADS * HEAD_DIM + vh * HEAD_DIM + vi]);
-                residual = s_beta * (v_val - kdot_partial);
+                residual = beta * (v_val - kdot_partial);
             }
             residual = __shfl_sync(kWarpMask, residual, 0);
 
             float output_partial = 0.0f;
             #pragma unroll
             for (int c = 0; c < MICRO_K_COLS_PER_LANE; c++) {
-                const int col = k_col_base + c;
-                state_vals[group][c] += s_k[col] * residual;
-                output_partial += s_q[col] * state_vals[group][c];
+                state_vals[group][c] += k_vals[c] * residual;
+                output_partial += q_vals[c] * state_vals[group][c];
             }
 
             for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {

@@ -39,10 +39,50 @@ constexpr int MICRO_STATE_TILE_ROWS = 2;
 constexpr int MICRO_BLOCK_THREADS = 64;
 constexpr int MICRO_K_COLS_PER_LANE = HEAD_DIM / WARP_SIZE;
 constexpr int LONG_ROWS_PER_WARP = DEFAULT_STATE_TILE_ROWS / NUM_WARPS;
+constexpr int MAX_CACHED_CUDA_DEVICES = 16;
 
 static_assert(HEAD_DIM % WARP_SIZE == 0, "HEAD_DIM must be warp aligned");
 static_assert(DEFAULT_STATE_TILE_ROWS % NUM_WARPS == 0,
               "Default state tile must divide evenly across warps");
+
+struct PersistingL2DeviceCache {
+    bool initialized;
+    bool supported;
+    bool limit_applied;
+    size_t set_aside_bytes;
+    size_t max_window_bytes;
+};
+
+// The persisting-L2 setup is identical across launches on a given device, so cache it
+// to trim host runtime overhead on the low-latency prefill paths.
+static inline PersistingL2DeviceCache* get_persisting_l2_device_cache(int device_id) {
+    static PersistingL2DeviceCache caches[MAX_CACHED_CUDA_DEVICES] = {};
+    if (device_id < 0 || device_id >= MAX_CACHED_CUDA_DEVICES) return nullptr;
+
+    PersistingL2DeviceCache& cache = caches[device_id];
+    if (!cache.initialized) {
+        cudaDeviceProp prop{};
+        cudaGetDeviceProperties(&prop, device_id);
+
+        cache.initialized = true;
+        cache.supported =
+            prop.persistingL2CacheMaxSize > 0 && prop.accessPolicyMaxWindowSize > 0;
+        if (!cache.supported) return &cache;
+
+        size_t set_aside_bytes = (static_cast<size_t>(prop.l2CacheSize) * 3) / 4;
+        const size_t max_persisting_bytes =
+            static_cast<size_t>(prop.persistingL2CacheMaxSize);
+        if (set_aside_bytes > max_persisting_bytes) {
+            set_aside_bytes = max_persisting_bytes;
+        }
+
+        cache.set_aside_bytes = set_aside_bytes;
+        cache.max_window_bytes =
+            static_cast<size_t>(prop.accessPolicyMaxWindowSize);
+    }
+
+    return &cache;
+}
 
 __device__ __forceinline__ float softplus(float x) {
     return log1pf(expf(x));
@@ -56,21 +96,37 @@ static inline void set_persisting_l2_window(
 ) {
     if (base_ptr == nullptr || total_bytes == 0) return;
 
-    cudaDeviceProp prop{};
-    cudaGetDeviceProperties(&prop, device_id);
-    if (prop.persistingL2CacheMaxSize <= 0 || prop.accessPolicyMaxWindowSize <= 0) return;
+    size_t set_aside_bytes = 0;
+    size_t max_window_bytes = 0;
+    PersistingL2DeviceCache* cache = get_persisting_l2_device_cache(device_id);
+    if (cache != nullptr) {
+        if (!cache->supported || cache->set_aside_bytes == 0 || cache->max_window_bytes == 0) {
+            return;
+        }
+        set_aside_bytes = cache->set_aside_bytes;
+        max_window_bytes = cache->max_window_bytes;
+        if (!cache->limit_applied) {
+            cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize, set_aside_bytes);
+            cache->limit_applied = true;
+        }
+    } else {
+        cudaDeviceProp prop{};
+        cudaGetDeviceProperties(&prop, device_id);
+        if (prop.persistingL2CacheMaxSize <= 0 || prop.accessPolicyMaxWindowSize <= 0) return;
 
-    size_t set_aside_bytes = (static_cast<size_t>(prop.l2CacheSize) * 3) / 4;
-    const size_t max_persisting_bytes = static_cast<size_t>(prop.persistingL2CacheMaxSize);
-    if (set_aside_bytes > max_persisting_bytes) {
-        set_aside_bytes = max_persisting_bytes;
+        set_aside_bytes = (static_cast<size_t>(prop.l2CacheSize) * 3) / 4;
+        const size_t max_persisting_bytes =
+            static_cast<size_t>(prop.persistingL2CacheMaxSize);
+        if (set_aside_bytes > max_persisting_bytes) {
+            set_aside_bytes = max_persisting_bytes;
+        }
+        max_window_bytes = static_cast<size_t>(prop.accessPolicyMaxWindowSize);
+        if (set_aside_bytes == 0 || max_window_bytes == 0) return;
+
+        cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize, set_aside_bytes);
     }
-    if (set_aside_bytes == 0) return;
-
-    cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize, set_aside_bytes);
 
     size_t window_bytes = total_bytes;
-    const size_t max_window_bytes = static_cast<size_t>(prop.accessPolicyMaxWindowSize);
     if (window_bytes > max_window_bytes) {
         window_bytes = max_window_bytes;
     }

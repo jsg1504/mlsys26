@@ -357,3 +357,19 @@ Tracking all optimization iterations for the prefill kernel.
 - Result: the quick Modal benchmark passed all `100/100` workloads with `mean_speedup 312.63872`, `mean_latency_ms 0.96398`, `min_speedup 47.28098`, and `max_speedup 1025.06332` versus the latest comparable logged quick baseline `mean_speedup 282.05599` and `mean_latency_ms 0.94532`.
 - Decision: commit because correctness held and the weighted `mean_speedup` improved versus the latest comparable quick baseline.
 - Research mode: `local_only`. External sources consulted directly this iteration: none.
+
+## 2026-04-08 Iteration 51
+
+- Idea: linearize the live `micro2` and `long16` launches so each `(seq, v_head)` issues consecutive row tiles, while leaving the recurrence math, tile ownership, and dispatch thresholds unchanged.
+- Why: research mode was `local_only`, so the ranking used only the live kernel, `logs/prefill/bench_history.jsonl`, `logs/prefill/optimization_log.md`, `docs/prefill_optimization_candidates_2026-04-08_en.md`, and the required fresh Modal profile. That profile remained directional rather than authoritative for prefill, but it still showed the family was low-occupancy and not bandwidth-saturated, while the latest committed quick baseline already proved that improving reused-input locality via the existing `k` persisting-L2 window could move the score. The current live launch order still spread a given `(seq, v_head)` tile family across intervening blocks, so the narrowest remaining locality-only experiment was to make row tiles consecutive without perturbing the proven math.
+- Result: the quick Modal benchmark passed all `100/100` workloads with `mean_speedup 188.41017`, `mean_latency_ms 1.16141`, `min_speedup 43.60603`, and `max_speedup 556.50717` versus the latest comparable logged quick baseline `mean_speedup 312.63872` and `mean_latency_ms 0.96398`.
+- Decision: revert because correctness held but the weighted `mean_speedup` regressed sharply versus the latest comparable quick baseline.
+- Research mode: `local_only`. External sources consulted directly this iteration: none.
+
+## 2026-04-08 Iteration 52
+
+- Idea: cache the per-device persisting-L2 capability and already-applied set-aside limit in the host helper so the live `micro2` and `long16` `k`-window paths avoid repeated `cudaGetDeviceProperties` and `cudaDeviceSetLimit` setup on every invocation.
+- Why: research mode was `local_only`, so the ranking used only the live kernel, `logs/prefill/bench_history.jsonl`, `logs/prefill/optimization_log.md`, `docs/prefill_optimization_candidates_2026-04-08_en.md`, and the required fresh Modal profile. That profile again stayed directional rather than authoritative for prefill, but it still showed the family was low-occupancy and latency-limited, especially on the low-`N` side where fixed overhead dominates. The latest committed quick baseline already proved that the `k` persisting-L2 windows are worth keeping, so the narrowest next step was to trim the host-side runtime setup cost those winning paths still paid on every call without changing math, launch mapping, or the access-policy window itself.
+- Result: the quick Modal benchmark passed all `100/100` workloads with `mean_speedup 347.11570`, `mean_latency_ms 0.95172`, `min_speedup 77.77`, and `max_speedup 1029.10` versus the latest comparable logged quick baseline `mean_speedup 312.63872` and `mean_latency_ms 0.96398`.
+- Decision: commit because correctness held and the weighted `mean_speedup` improved versus the latest comparable quick baseline.
+- Research mode: `local_only`. External sources consulted directly this iteration: none.

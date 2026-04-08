@@ -373,3 +373,83 @@ Tracking all optimization iterations for the prefill kernel.
 - Result: the quick Modal benchmark passed all `100/100` workloads with `mean_speedup 347.11570`, `mean_latency_ms 0.95172`, `min_speedup 77.77`, and `max_speedup 1029.10` versus the latest comparable logged quick baseline `mean_speedup 312.63872` and `mean_latency_ms 0.96398`.
 - Decision: commit because correctness held and the weighted `mean_speedup` improved versus the latest comparable quick baseline.
 - Research mode: `local_only`. External sources consulted directly this iteration: none.
+
+## 2026-04-08 Iteration 53
+
+- Idea: cache the per-device SM count in the existing host helper so the prefill wrapper avoids repeated `cudaDeviceGetAttribute(cudaDevAttrMultiProcessorCount)` setup on every invocation.
+- Why: research mode was `local_only`, so the ranking used only the live kernel, `logs/prefill/bench_history.jsonl`, `logs/prefill/optimization_log.md`, `docs/prefill_optimization_candidates_2026-04-08_en.md`, and the required fresh Modal profile. That profile stayed directionally consistent with the recent notes despite the harness caveat: low-`N` shapes still launched only `64` to `128` blocks with achieved occupancy around `6.11%` to `6.26%`, while the larger directional shapes still reached only `344` to `456` blocks with achieved occupancy around `14.33%` to `18.84%`. The latest committed quick baseline already showed that trimming host-side setup around the winning launch paths could move the score, so caching the remaining per-call device query was the narrowest follow-up that preserved math, dispatch thresholds, and the current `k` persisting-L2 policy.
+- Result: the quick Modal benchmark passed all `100/100` workloads with `mean_speedup 270.72595`, `mean_latency_ms 0.94042`, `min_speedup 79.69704`, and `max_speedup 911.08466` versus the latest comparable logged quick baseline `mean_speedup 347.11570` and `mean_latency_ms 0.95172`.
+- Decision: revert because correctness held but the weighted `mean_speedup` regressed versus the latest comparable quick baseline.
+- Research mode: `local_only`. External sources consulted directly this iteration: none.
+
+## 2026-04-08 Iteration 54
+
+- Idea: bias only the live `micro2` and `long16` prefill kernels toward L1 with a cached one-time `cudaFuncSetCacheConfig(..., cudaFuncCachePreferL1)` setup, while leaving the recurrence math, `k` persisting-L2 window, and dispatch thresholds unchanged.
+- Why: research mode was `local_only`, so the ranking used only the live kernel, `logs/prefill/bench_history.jsonl`, `logs/prefill/optimization_log.md`, `docs/prefill_optimization_candidates_2026-04-08_en.md`, and the required fresh Modal profile. That profile again stayed directional rather than authoritative for prefill, but it remained consistent on the points that matter here: the family is still small-grid, weakly latency-hidden, and far from bandwidth saturation. The live wrapper is still dominated by the `micro2` and `long16` paths, both of which use little or no shared memory while repeatedly reloading `q`, `k`, and state slices, so the narrowest untried cache-only follow-up was to bias those two live kernels toward L1 without perturbing the proven math or launch mapping.
+- Result: the captured quick Modal benchmark passed all `100/100` workloads with `mean_speedup 223.11740`, `mean_latency_ms 0.94620`, `min_speedup 73.01`, and `max_speedup 749.63` versus the latest comparable logged quick baseline `mean_speedup 347.11570` and `mean_latency_ms 0.95172`.
+- Decision: revert because correctness held but the weighted `mean_speedup` regressed sharply versus the latest comparable quick baseline.
+- Research mode: `local_only`. External sources consulted directly this iteration: none.
+
+## 2026-04-08 Iteration 55
+
+- Idea: keep the existing `k`-input persisting-L2 access window sticky across consecutive `micro2` and `long16` launches, and skip redundant access-policy clear/set churn unless the wrapper falls back to a non-windowed kernel path.
+- Why: research mode was `local_only`, so the ranking used only the live kernel, `logs/prefill/bench_history.jsonl`, `logs/prefill/optimization_log.md`, `docs/prefill_optimization_candidates_2026-04-08_en.md`, and the required fresh Modal profile. That profile again stayed directional rather than authoritative for prefill, but it still showed the family was small-grid, weakly latency-hidden, and dominated by fixed overhead. Iteration 52 had already shown that trimming host-side setup around the winning `k` window can move the score, so the narrowest next host-side experiment was to avoid reprogramming the same access-policy window on every consecutive windowed launch.
+- Result: the quick Modal benchmark passed all `100/100` workloads with `mean_speedup 147.91910`, `mean_latency_ms 0.93940`, `min_speedup 59.02852`, and `max_speedup 418.21575` versus the latest comparable logged quick baseline `mean_speedup 347.11570` and `mean_latency_ms 0.95172`.
+- Decision: revert because correctness held but the weighted `mean_speedup` regressed sharply versus the latest comparable quick baseline.
+- Research mode: `local_only`. External sources consulted directly this iteration: none.
+
+## 2026-04-08 Iteration 56
+
+- Idea: retarget only the live `micro2` persisting-L2 access window from the reused `k` input to the reused `q` input, while leaving the winning `long16` `k` window unchanged.
+- Why: research mode was `local_only`, so the ranking used only the live kernel, `logs/prefill/bench_history.jsonl`, `logs/prefill/optimization_log.md`, `docs/prefill_optimization_candidates_2026-04-08_en.md`, and the required fresh Modal profile. That profile remained directional rather than authoritative for prefill, but it still showed the low-`N` shapes are weakly latency-hidden and dominated by fixed overhead. Iteration 50 already showed that the `micro2` path's persisting-L2 window can move the score, and `q` is reread across the same `64` row tiles and sibling `v_head`s there, so switching the short-path window target was the narrowest remaining locality-only follow-up that left the recurrence math and the proven `long16` path unchanged.
+- Result: the quick Modal benchmark passed all `100/100` workloads with `mean_speedup 257.96553`, `mean_latency_ms 0.94280`, `min_speedup 80.48121`, and `max_speedup 747.91618` versus the latest comparable logged quick baseline `mean_speedup 347.11570` and `mean_latency_ms 0.95172`.
+- Decision: revert because correctness held but the weighted `mean_speedup` regressed versus the latest comparable quick baseline.
+- Research mode: `local_only`. External sources consulted directly this iteration: none.
+
+## 2026-04-08 Iteration 57
+
+- Idea: convert only the live `long16` prefill kernel's per-token `q/k/a/b_gate/v/output` index math into fixed-stride pointer walks so the dominant long path advances through each tensor without recomputing base offsets every timestep.
+- Why: research mode was `local_only`, so the ranking used only the live kernel, `logs/prefill/bench_history.jsonl`, `logs/prefill/optimization_log.md`, `docs/prefill_optimization_candidates_2026-04-08_en.md`, and the required fresh Modal profile. That profile remained directional rather than authoritative for prefill, but it still showed the family was small-grid and latency-limited, with achieved occupancy only about `6.25%` on low-`N` shapes and `14.33%` to `18.85%` on the larger shapes while compute and memory throughput stayed low. The latest comparable committed quick benchmark baseline remained Iteration 52 at `mean_speedup 347.11570`, and because `long16` still owns most token volume, trimming hot-loop address arithmetic in that path was the narrowest untried local-only follow-up that preserved the proven math, launch mapping, and persisting-L2 policy.
+- Result: the quick Modal benchmark passed all `100/100` workloads with `mean_speedup 233.81990`, `mean_latency_ms 1.18400`, `min_speedup 77.26`, and `max_speedup 641.17` versus the latest comparable logged quick baseline `mean_speedup 347.11570` and `mean_latency_ms 0.95172`.
+- Decision: revert because correctness held but the weighted `mean_speedup` regressed sharply versus the latest comparable quick baseline.
+- Research mode: `local_only`. External sources consulted directly this iteration: none.
+
+## 2026-04-08 Iteration 58
+
+- Idea: retarget only the live `long16` persisting-L2 access window from the reused `k` input to the reused `q` input, while leaving the winning `micro2` `k` window unchanged.
+- Why: research mode was `local_only`, so the ranking used only the live kernel, `logs/prefill/bench_history.jsonl`, `logs/prefill/optimization_log.md`, `docs/prefill_optimization_candidates_2026-04-08_en.md`, and the required Modal profile. That profile remained directional rather than authoritative for prefill, but it again showed the family was small-grid, weakly latency-hidden, and dominated by fixed per-tile overhead. The local docs already ruled out more row-heuristic churn and most scalar long-path tuning, while the current note still left narrow long16 persisting-L2 input-window trials as the only same-family current-code experiment worth testing. After the committed long16 `k` window win and the reverted long16 `a` and `b_gate` window trials, `q` was the only reused long16 input in that set that had not yet been tried.
+- Result: the quick Modal benchmark passed all `100/100` workloads with `mean_speedup 135.64040`, `mean_latency_ms 0.91047`, `min_speedup 51.73`, and `max_speedup 393.54` versus the latest comparable logged quick baseline `mean_speedup 347.11570` and `mean_latency_ms 0.95172`.
+- Decision: revert because correctness held but the weighted `mean_speedup` regressed sharply versus the latest comparable quick baseline.
+- Research mode: `local_only`. External sources consulted directly this iteration: none.
+
+## 2026-04-08 Iteration 59
+
+- Idea: convert only the live `micro2` prefill kernel's per-token `q/k/a/b_gate/v/output` index math into fixed-stride pointer walks so the dominant short path advances through each tensor without recomputing base offsets every timestep.
+- Why: research mode was `local_only`, so the ranking used only the live kernel, `logs/prefill/bench_history.jsonl`, `logs/prefill/optimization_log.md`, `docs/prefill_optimization_candidates_2026-04-08_en.md`, the local contest workload file, and the required fresh Modal profile. That profile remained directional rather than authoritative for prefill, but it still showed the family is small-grid and weakly latency-hidden, especially on the low-`N` side. The live wrapper still routes `61/100` workloads through `micro2`, and unlike the reverted `long16` pointer-walk attempt, this isolates the fixed-overhead reduction to the short path without perturbing the current `long16` winner.
+- Result: the quick Modal benchmark passed all `100/100` workloads with `mean_speedup 222.1183`, `mean_latency_ms 0.9605`, `min_speedup 77.79`, and `max_speedup 708.32` versus the latest comparable logged quick baseline `mean_speedup 347.11570` and `mean_latency_ms 0.95172`.
+- Decision: revert because correctness held but the weighted `mean_speedup` regressed versus the latest comparable quick baseline.
+- Research mode: `local_only`. External sources consulted directly this iteration: none.
+
+## 2026-04-08 Iteration 60
+
+- Idea: add `__launch_bounds__(128, 8)` only to the live `long16` prefill kernel so the compiler trims register pressure on the registerized long path without perturbing `micro2` or the wrapper dispatch.
+- Why: research mode was `local_only`, so the ranking used only the live kernel, `logs/prefill/bench_history.jsonl`, `logs/prefill/optimization_log.md`, `docs/prefill_optimization_candidates_2026-04-08_en.md`, and the required fresh Modal profile. The profile is still directional rather than authoritative for prefill, so the decision leaned on the checked-in live code shape instead: the current winner keeps the `long16` path registerized and warp-private, and that path still owns most token volume. This made a modest long-path-only launch-bounds hint the narrowest remaining register-pressure experiment that did not re-open the ruled-out row heuristics, vectorization-only patches, or extra locality churn.
+- Result: the quick Modal benchmark passed all `100/100` workloads with `mean_speedup 269.71810`, `mean_latency_ms 0.73682`, `min_speedup 77.25788`, and `max_speedup 805.09599` versus the latest comparable logged quick baseline `mean_speedup 347.11570` and `mean_latency_ms 0.95172`.
+- Decision: revert because correctness held but the weighted `mean_speedup` regressed versus the latest comparable quick baseline.
+- Research mode: `local_only`. External sources consulted directly this iteration: none.
+
+## 2026-04-08 Iteration 61
+
+- Idea: hoist the live `long16` and `micro2` kernels' CTA-invariant `A_exp = expf(A_log[vh])` and `dt_bias[vh]` setup into one per-block broadcast so each block stops reloading and recomputing those gate-prefix scalars once per warp.
+- Why: research mode was `local_only`, so the ranking used only the live kernel, `logs/prefill/bench_history.jsonl`, `logs/prefill/optimization_log.md`, `docs/prefill_optimization_candidates_2026-04-08_en.md`, and the required fresh Modal profile. The profile remained directional rather than authoritative for prefill, but it again showed the family is small-grid, weakly latency-hidden, and dominated by fixed overhead. With the recent log already ruling out more row-heuristic churn, cache-window retargeting, pointer walks, and launch-bounds tuning, the narrowest remaining fixed-overhead experiment inside the current scalar family was to remove the redundant per-warp `A_log`/`dt_bias` setup from the two live kernels without perturbing the recurrence math or wrapper dispatch.
+- Result: the quick Modal benchmark passed all `100/100` workloads with `mean_speedup 137.66443`, `mean_latency_ms 0.93778`, `min_speedup 46.31100`, and `max_speedup 394.80121` versus the latest comparable logged quick baseline `mean_speedup 347.11570` and `mean_latency_ms 0.95172`.
+- Decision: revert because correctness held but the weighted `mean_speedup` regressed sharply versus the latest comparable quick baseline.
+- Research mode: `local_only`. External sources consulted directly this iteration: none.
+
+## 2026-04-08 Iteration 62
+
+- Idea: rewrite only the `N >= 3` / `long16` regime as a correctness-first `chunk_size = 128` chunked prefill backend while keeping `N <= 2` on the existing `micro2` path.
+- Why: research mode was `local_only`, so the ranking used only the live kernel, `logs/prefill/bench_history.jsonl`, `logs/prefill/optimization_log.md`, and `docs/prefill_optimization_candidates_2026-04-08_en.md`. That document had already ranked a chunked long-path rewrite as the best next direction once the scalar family was exhausted, and the latest comparable committed quick baseline remained Iteration 52 at `mean_speedup 347.11570`. The implementation kept the current public contract and GVA mapping, started with `chunk_size = 128`, and intentionally stopped short of any CuTe/CUTLASS SM100, TMA, TMEM, or persistent scheduling work so this iteration stayed within Phase 3's correctness-first scope.
+- Result: the quick Modal benchmark passed all `100/100` workloads with `mean_speedup 263.59630`, `mean_latency_ms 1.02399`, `min_speedup 93.31`, and `max_speedup 651.53` versus the latest comparable logged quick baseline `mean_speedup 347.11570` and `mean_latency_ms 0.95172`.
+- Decision: revert because correctness held but the weighted `mean_speedup` regressed versus the latest comparable quick baseline.
+- Research mode: `local_only`. External sources consulted directly this iteration: none.

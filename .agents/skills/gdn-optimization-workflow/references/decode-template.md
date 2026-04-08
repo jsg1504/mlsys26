@@ -20,10 +20,10 @@ Before ranking ideas, run:
 `conda run -n fi-bench modal run scripts/profile_kernel.py --kernel decode`
 Also read any relevant materials under `docs/` before ranking ideas.
 Actively consult relevant official documentation and papers if they help validate bottlenecks or improve the proposed optimization.
-Treat the latest comparable quick benchmark entry as baseline.
+Treat the latest comparable committed quick benchmark entry as baseline when one exists. If decode has no optimization-iteration commit yet, use the latest quick benchmark entry and call out that bootstrap assumption explicitly.
 Use the current profile results to identify the dominant bottlenecks and cite the relevant profile findings.
 Identify the most likely current bottleneck in the decode kernel and rank 2-3 next optimization ideas for a single iteration.
-Return the top recommendation, expected impact, implementation sketch, any correctness constraints, which `docs/` files informed the recommendation, and which official documents or papers materially influenced it.
+Return the top recommendation, expected impact, implementation sketch, any correctness constraints, which benchmark entry is the baseline, which `docs/` files informed the recommendation, and which official documents or papers materially influenced it.
 ```
 
 ## Worker Message: Implement
@@ -48,7 +48,7 @@ Return pass or fail, findings by severity, and whether benchmarking is safe.
 ```text
 Run the quick Modal benchmark for decode:
 `conda run -n fi-bench modal run scripts/run_modal_subfolder.py --subfolder gdn_decode_qk4_v8_d128_k_last`
-Parse the benchmark output, append a new entry to `logs/decode/bench_history.jsonl`, compare it against the latest comparable quick benchmark baseline already in that log, and recommend `revert` or `commit`.
+Parse the benchmark output, compare it against the latest comparable committed quick benchmark baseline already in `logs/decode/bench_history.jsonl` when one exists, append a new entry to `logs/decode/bench_history.jsonl`, append a short note to `logs/decode/optimization_log.md`, and recommend `revert` or `commit`.
 The appended JSON line must include `decision` with that final recommendation.
 Use correctness regression or no performance improvement as `revert`.
 ```

@@ -24,13 +24,16 @@ Rank the next high-impact optimization for the target GDN kernel using the curre
 4. Read the most relevant `docs/` materials before proposing ideas. Prefer kernel-specific notes first, then broader architecture or CUDA references.
 5. Actively consult relevant official documentation and papers when they can improve bottleneck analysis, validate an optimization idea, or reveal better implementation tactics.
 6. Prefer primary sources for technical claims: official vendor documentation, official framework documentation, and original or authoritative papers.
-7. Identify the most plausible current bottlenecks.
-8. Research relevant GDN, linear attention, CUDA, and B200 ideas if needed.
-9. Return 2-3 ranked optimization ideas for the next single iteration.
+7. For prefill, treat `scripts/profile_kernel.py` as directional if it diverges from the current wrapper dispatch or the latest logged quick-benchmark evidence.
+8. Use the latest comparable quick benchmark baseline with `decision == "commit"` for the same kernel and workload mode when available. If none exists yet, use the latest quick benchmark entry and call out that bootstrap assumption explicitly.
+9. Identify the most plausible current bottlenecks.
+10. Research relevant GDN, linear attention, CUDA, and B200 ideas if needed.
+11. Return 2-3 ranked optimization ideas for the next single iteration.
 
 ## Output
 
 - Current bottleneck summary
+- Comparable baseline entry used and why it qualifies
 - Which `docs/` materials were consulted and how they influenced the ranking
 - Which official documents or papers were consulted and how they influenced the ranking
 - Ranked ideas with expected impact

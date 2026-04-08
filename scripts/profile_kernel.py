@@ -2,488 +2,226 @@
 Profile GDN decode or prefill kernel with NCU on Modal B200.
 
 Usage:
-  modal run scripts/profile_kernel.py   (profiles both decode and prefill)
+  modal run scripts/profile_kernel.py --kernel decode
+  modal run scripts/profile_kernel.py --kernel prefill
+  modal run scripts/profile_kernel.py --kernel both
+  modal run scripts/profile_kernel.py --kernel decode --max-workloads 3
+  modal run scripts/profile_kernel.py --kernel prefill --prefill-path micro2 --max-workloads 3
+  modal run scripts/profile_kernel.py --kernel prefill --prefill-path long16 --max-workloads 3
 
-Workloads are derived from the actual contest dataset:
-  - Decode: B in {1, 4, 8, 16, 32, 48, 64}
-  - Prefill: representative (num_seqs, total_seq_len) pairs covering
-    the full distribution from mlsys26-contest workloads
-
-Edit PROFILE_CONFIG below to customize.
+Uses flashinfer_bench's solution runner for build/execution,
+but invokes NCU directly (without NVTX filtering) for profiling.
+Workloads come from the actual contest trace set.
 """
 
-import modal
-import textwrap
+import sys
+from collections import Counter
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).parent.parent
+sys.path.insert(0, str(PROJECT_ROOT))
 
-# ──────────── Configuration (from contest workloads) ──────────
-PROFILE_CONFIG = {
-    "decode": {
-        # All 7 batch sizes from contest dataset
-        "batch_sizes": [1, 4, 8, 16, 32, 48, 64],
-    },
-    "prefill": {
-        # Representative (num_seqs, total_seq_len) from actual workloads.
-        # Covers: small/large T, low/high N, each split_factor tier.
-        # Script creates uniform seq lengths: each seq gets T_total/N tokens.
-        "workloads": [
-            (1, 16),      # N=1 short  (split=8, 64 blocks)
-            (1, 134),     # N=1 medium (split=8, 64 blocks)
-            (1, 2107),    # N=1 long   (split=8, 64 blocks)
-            (2, 983),     # N=2        (split=8, 128 blocks)
-            (3, 2857),    # N=3 long   (split=8, 192 blocks)
-            (4, 959),     # N=4        (split=8, 256 blocks)
-            (20, 8192),   # N=20       (split=4, 640 blocks)  -- different split tier
-            (43, 8192),   # N=43       (split=1, 344 blocks)  -- split=1
-            (57, 8192),   # N=57 max   (split=1, 456 blocks)
-        ],
-    },
-    "sections": ["SpeedOfLight", "MemoryWorkloadAnalysis", "LaunchStats", "Occupancy"],
-}
-# ──────────────────────────────────────────────────────────────
+import modal
+from flashinfer_bench import Solution, TraceSet
 
 app = modal.App("ncu-profile")
 
-image = modal.Image.from_registry(
-    "nvidia/cuda:13.2.0-devel-ubuntu24.04", add_python="3.12"
+trace_volume = modal.Volume.from_name("flashinfer-trace", create_if_missing=True)
+TRACE_SET_PATH = "/data"
+
+image = (
+    modal.Image.from_registry(
+        "nvidia/cuda:13.2.0-devel-ubuntu22.04",
+        add_python="3.12",
+    )
+    .pip_install("flashinfer-bench", "torch", "triton", "numpy")
 )
 
-DECODE_MAIN_TEMPLATE = r"""
-#include <cuda_runtime.h>
-#include <cuda_bf16.h>
-#include <cstdio>
-#include <cstdlib>
-#include <cmath>
-#include <curand.h>
+SECTIONS = ["SpeedOfLight", "MemoryWorkloadAnalysis", "LaunchStats", "Occupancy"]
 
-using bf16 = __nv_bfloat16;
-constexpr int NUM_Q_HEADS = 4;
-constexpr int NUM_K_HEADS = 4;
-constexpr int NUM_V_HEADS = 8;
-constexpr int HEAD_DIM = 128;
-constexpr int V_PER_Q = NUM_V_HEADS / NUM_Q_HEADS;
+NUM_V_HEADS = 8
+HEAD_DIM = 128
+DEFAULT_STATE_TILE_ROWS = 16
+SMALL_STATE_TILE_ROWS = 8
+TINY_STATE_TILE_ROWS = 4
+PREFILL_DEFINITION = "gdn_prefill_qk4_v8_d128_k_last"
+VALID_PREFILL_PATHS = ("all", "micro2", "long16")
 
-__device__ __forceinline__ float softplus(float x) { return log1pf(expf(x)); }
-__device__ __forceinline__ float warp_reduce_sum(float val) {
-    for (int offset = 16; offset > 0; offset >>= 1)
-        val += __shfl_down_sync(0xffffffff, val, offset);
-    return val;
+# Kernel name regex patterns for NCU --kernel-name
+KERNEL_NAMES = {
+    "gdn_decode_qk4_v8_d128_k_last": "gdn_decode_kernel",
+}
+PREFILL_KERNEL_REGEX = {
+    "all": r"gdn_prefill_kernel.*",
+    "micro2": r"gdn_prefill_kernel_micro",
+    "long16": r"gdn_prefill_kernel_long",
 }
 
-$$KERNEL$$
 
-void fill_random_bf16(bf16* d_ptr, int n) {
-    float* tmp; cudaMalloc(&tmp, n * sizeof(float));
-    curandGenerator_t gen; curandCreateGenerator(&gen, CURAND_RNG_PSEUDO_DEFAULT);
-    curandSetPseudoRandomGeneratorSeed(gen, 42);
-    curandGenerateNormal(gen, tmp, n, 0.0f, 1.0f);
-    float* h = (float*)malloc(n * sizeof(float));
-    cudaMemcpy(h, tmp, n * sizeof(float), cudaMemcpyDeviceToHost);
-    bf16* hb = (bf16*)malloc(n * sizeof(bf16));
-    for (int i = 0; i < n; i++) hb[i] = __float2bfloat16(h[i]);
-    cudaMemcpy(d_ptr, hb, n * sizeof(bf16), cudaMemcpyHostToDevice);
-    free(h); free(hb); cudaFree(tmp); curandDestroyGenerator(gen);
-}
-void fill_random_f32(float* d_ptr, int n) {
-    curandGenerator_t gen; curandCreateGenerator(&gen, CURAND_RNG_PSEUDO_DEFAULT);
-    curandSetPseudoRandomGeneratorSeed(gen, 42);
-    curandGenerateNormal(gen, d_ptr, n, 0.0f, 1.0f);
-    curandDestroyGenerator(gen);
-}
+@app.function(
+    image=image, gpu="B200:1", timeout=1800,
+    volumes={TRACE_SET_PATH: trace_volume},
+)
+def profile(solution: Solution, max_workloads: int = 0, prefill_path: str = "all"):
+    """Profile a solution against its workloads using NCU."""
+    import subprocess
+    import tempfile
 
-int main(int argc, char** argv) {
-    int B = atoi(argv[1]);
-    printf("Profiling DECODE kernel B=%d\n", B);
+    import torch
 
-    bf16 *q, *k, *v, *a_gate, *b_gate, *output;
-    float *state, *A_log, *dt_bias, *new_state;
-    cudaMalloc(&q, B * NUM_Q_HEADS * HEAD_DIM * sizeof(bf16));
-    cudaMalloc(&k, B * NUM_K_HEADS * HEAD_DIM * sizeof(bf16));
-    cudaMalloc(&v, B * NUM_V_HEADS * HEAD_DIM * sizeof(bf16));
-    cudaMalloc(&state, B * NUM_V_HEADS * HEAD_DIM * HEAD_DIM * sizeof(float));
-    cudaMalloc(&A_log, NUM_V_HEADS * sizeof(float));
-    cudaMalloc(&a_gate, B * NUM_V_HEADS * sizeof(bf16));
-    cudaMalloc(&dt_bias, NUM_V_HEADS * sizeof(float));
-    cudaMalloc(&b_gate, B * NUM_V_HEADS * sizeof(bf16));
-    cudaMalloc(&output, B * NUM_V_HEADS * HEAD_DIM * sizeof(bf16));
-    cudaMalloc(&new_state, B * NUM_V_HEADS * HEAD_DIM * HEAD_DIM * sizeof(float));
+    trace_set = TraceSet.from_path(TRACE_SET_PATH)
+    definition_name = solution.definition
 
-    fill_random_bf16(q, B*NUM_Q_HEADS*HEAD_DIM);
-    fill_random_bf16(k, B*NUM_K_HEADS*HEAD_DIM);
-    fill_random_bf16(v, B*NUM_V_HEADS*HEAD_DIM);
-    fill_random_f32(state, B*NUM_V_HEADS*HEAD_DIM*HEAD_DIM);
-    fill_random_f32(A_log, NUM_V_HEADS);
-    fill_random_bf16(a_gate, B*NUM_V_HEADS);
-    fill_random_f32(dt_bias, NUM_V_HEADS);
-    fill_random_bf16(b_gate, B*NUM_V_HEADS);
-    float scale = 0.08838834764831843f;
-    cudaDeviceSynchronize();
+    if definition_name not in trace_set.definitions:
+        print(f"ERROR: Definition '{definition_name}' not found in trace set")
+        return {}
 
-    int sf;
-    if (B <= 2) sf = 8;
-    else if (B <= 4) sf = 4;
-    else if (B <= 16) sf = 2;
-    else sf = 1;
+    definition = trace_set.definitions[definition_name]
+    workload_traces = trace_set.workloads.get(definition_name, [])
+    if not workload_traces:
+        print(f"ERROR: No workloads found for '{definition_name}'")
+        return {}
 
-    dim3 grid(B * NUM_V_HEADS * sf);
-    dim3 block(HEAD_DIM);
+    sm_count = torch.cuda.get_device_properties(0).multi_processor_count
+    dispatch_counts = Counter()
+    if definition_name == PREFILL_DEFINITION:
+        filtered_workloads = []
+        for trace in workload_traces:
+            dispatch = classify_prefill_dispatch(trace.workload.axes["num_seqs"], sm_count)
+            dispatch_counts[dispatch] += 1
+            if prefill_path == "all" or dispatch == prefill_path:
+                filtered_workloads.append(trace)
+        workload_traces = filtered_workloads
 
-    for (int i = 0; i < 3; i++)
-        gdn_decode_kernel<<<grid, block>>>(q,k,v,state,A_log,a_gate,dt_bias,b_gate,scale,output,new_state,B,sf);
-    cudaDeviceSynchronize();
+    if max_workloads > 0:
+        workload_traces = workload_traces[:max_workloads]
 
-    gdn_decode_kernel<<<grid, block>>>(q,k,v,state,A_log,a_gate,dt_bias,b_gate,scale,output,new_state,B,sf);
-    cudaDeviceSynchronize();
+    kernel_name = resolve_kernel_name(definition_name, prefill_path)
 
-    printf("Done.\n");
-    cudaFree(q); cudaFree(k); cudaFree(v); cudaFree(state);
-    cudaFree(A_log); cudaFree(a_gate); cudaFree(dt_bias); cudaFree(b_gate);
-    cudaFree(output); cudaFree(new_state);
-    return 0;
-}
-"""
-
-PREFILL_MAIN_TEMPLATE = r"""
-#include <cuda_runtime.h>
-#include <cuda_bf16.h>
-#include <cstdio>
-#include <cstdlib>
-#include <cmath>
-#include <cstdint>
-#include <curand.h>
-
-using bf16 = __nv_bfloat16;
-constexpr int NUM_Q_HEADS = 4;
-constexpr int NUM_K_HEADS = 4;
-constexpr int NUM_V_HEADS = 8;
-constexpr int HEAD_DIM = 128;
-constexpr int V_PER_Q = NUM_V_HEADS / NUM_Q_HEADS;
-constexpr int NUM_WARPS = HEAD_DIM / 32;
-
-__device__ __forceinline__ float softplus(float x) { return log1pf(expf(x)); }
-
-$$KERNEL$$
-
-void fill_random_bf16(bf16* d_ptr, int n) {
-    float* tmp; cudaMalloc(&tmp, n * sizeof(float));
-    curandGenerator_t gen; curandCreateGenerator(&gen, CURAND_RNG_PSEUDO_DEFAULT);
-    curandSetPseudoRandomGeneratorSeed(gen, 42);
-    curandGenerateNormal(gen, tmp, n, 0.0f, 1.0f);
-    float* h = (float*)malloc(n * sizeof(float));
-    cudaMemcpy(h, tmp, n * sizeof(float), cudaMemcpyDeviceToHost);
-    bf16* hb = (bf16*)malloc(n * sizeof(bf16));
-    for (int i = 0; i < n; i++) hb[i] = __float2bfloat16(h[i]);
-    cudaMemcpy(d_ptr, hb, n * sizeof(bf16), cudaMemcpyHostToDevice);
-    free(h); free(hb); cudaFree(tmp); curandDestroyGenerator(gen);
-}
-void fill_random_f32(float* d_ptr, int n) {
-    curandGenerator_t gen; curandCreateGenerator(&gen, CURAND_RNG_PSEUDO_DEFAULT);
-    curandSetPseudoRandomGeneratorSeed(gen, 42);
-    curandGenerateNormal(gen, d_ptr, n, 0.0f, 1.0f);
-    curandDestroyGenerator(gen);
-}
-
-int main(int argc, char** argv) {
-    int N = atoi(argv[1]);   // num_seqs
-    int T_per = atoi(argv[2]); // seq_len per sequence
-    int T = N * T_per;       // total tokens
-    printf("Profiling PREFILL kernel N=%d, T_per=%d, T_total=%d\n", N, T_per, T);
-
-    // Build cu_seqlens: [0, T_per, 2*T_per, ..., N*T_per]
-    int64_t* h_cu = (int64_t*)malloc((N + 1) * sizeof(int64_t));
-    for (int i = 0; i <= N; i++) h_cu[i] = (int64_t)i * T_per;
-    int64_t* cu_seqlens;
-    cudaMalloc(&cu_seqlens, (N + 1) * sizeof(int64_t));
-    cudaMemcpy(cu_seqlens, h_cu, (N + 1) * sizeof(int64_t), cudaMemcpyHostToDevice);
-    free(h_cu);
-
-    bf16 *q, *k, *v, *a_gate, *b_gate, *output;
-    float *state, *A_log, *dt_bias, *new_state;
-    cudaMalloc(&q, T * NUM_Q_HEADS * HEAD_DIM * sizeof(bf16));
-    cudaMalloc(&k, T * NUM_K_HEADS * HEAD_DIM * sizeof(bf16));
-    cudaMalloc(&v, T * NUM_V_HEADS * HEAD_DIM * sizeof(bf16));
-    cudaMalloc(&state, N * NUM_V_HEADS * HEAD_DIM * HEAD_DIM * sizeof(float));
-    cudaMalloc(&A_log, NUM_V_HEADS * sizeof(float));
-    cudaMalloc(&a_gate, T * NUM_V_HEADS * sizeof(bf16));
-    cudaMalloc(&dt_bias, NUM_V_HEADS * sizeof(float));
-    cudaMalloc(&b_gate, T * NUM_V_HEADS * sizeof(bf16));
-    cudaMalloc(&output, T * NUM_V_HEADS * HEAD_DIM * sizeof(bf16));
-    cudaMalloc(&new_state, N * NUM_V_HEADS * HEAD_DIM * HEAD_DIM * sizeof(float));
-
-    fill_random_bf16(q, T*NUM_Q_HEADS*HEAD_DIM);
-    fill_random_bf16(k, T*NUM_K_HEADS*HEAD_DIM);
-    fill_random_bf16(v, T*NUM_V_HEADS*HEAD_DIM);
-    fill_random_f32(state, N*NUM_V_HEADS*HEAD_DIM*HEAD_DIM);
-    fill_random_f32(A_log, NUM_V_HEADS);
-    fill_random_bf16(a_gate, T*NUM_V_HEADS);
-    fill_random_f32(dt_bias, NUM_V_HEADS);
-    fill_random_bf16(b_gate, T*NUM_V_HEADS);
-    float scale = 0.08838834764831843f;
-    cudaDeviceSynchronize();
-
-$$PREFILL_LAUNCH_CONFIG$$
-
-$$PREFILL_LAUNCH_HELPER$$
-
-    // Warmup
-$$PREFILL_WARMUP$$
-    cudaDeviceSynchronize();
-
-    // Profiled run
-$$PREFILL_PROFILED$$
-    cudaDeviceSynchronize();
-
-    printf("Done.\n");
-    cudaFree(q); cudaFree(k); cudaFree(v); cudaFree(state);
-    cudaFree(A_log); cudaFree(a_gate); cudaFree(dt_bias); cudaFree(b_gate);
-    cudaFree(cu_seqlens); cudaFree(output); cudaFree(new_state);
-    return 0;
-}
-"""
-
-
-def extract_kernel(src: str, kernel_type: str) -> str:
-    """Extract kernel function(s) from source, stripping TVM FFI wrapper."""
-    lines = src.split("\n")
-    result = []
-    skip_func = False
-    brace_depth = 0
-
-    for line in lines:
-        # Skip TVM includes
-        if "#include <tvm/" in line:
-            continue
-        # Skip using/constexpr (already in template)
-        if line.startswith("using bf16") or line.startswith("constexpr int NUM_"):
-            continue
-        if line.startswith("constexpr int HEAD_DIM") or line.startswith("constexpr int V_PER_Q"):
-            continue
-        if line.startswith("constexpr int NUM_WARPS"):
-            continue
-        # Skip softplus (already in template)
-        if "__device__ __forceinline__ float softplus" in line:
-            skip_func = True
-            brace_depth = 0
-        if "__device__ __forceinline__ float warp_reduce_sum" in line:
-            skip_func = True
-            brace_depth = 0
-        if skip_func:
-            brace_depth += line.count("{") - line.count("}")
-            if brace_depth <= 0 and "{" in "".join(result[-5:] if result else []):
-                skip_func = False
-            if line.strip() == "}" and brace_depth <= 0:
-                skip_func = False
-            continue
-        # Stop at host wrapper
-        if kernel_type == "decode" and "void gdn_decode(" in line and "__global__" not in line:
-            break
-        if kernel_type == "prefill" and "void gdn_prefill(" in line and "__global__" not in line:
-            break
-        if "TVM_FFI_DLL_EXPORT" in line:
-            continue
-        result.append(line)
-
-    return "\n".join(result)
-
-
-def build_prefill_main(prefill_kernel: str) -> str:
-    """Build a profiling harness that matches the current prefill kernel shape."""
-    templated_kernel = (
-        "template <" in prefill_kernel or "template<" in prefill_kernel
-    ) and "gdn_prefill_kernel" in prefill_kernel
-    uses_dynamic_smem = "extern __shared__" in prefill_kernel
-
-    if templated_kernel:
-        launch_config = """
-    int sf;
-    if (N <= 8) sf = 8;
-    else if (N <= 16) sf = 4;
-    else if (N <= 32) sf = 2;
-    else sf = 1;
-
-    dim3 grid(N * NUM_V_HEADS * sf);
-    dim3 block(HEAD_DIM);
-"""
-        launch_helper = """
-    auto launch = [&](auto kernel_fn) {
-        kernel_fn<<<grid, block>>>(
-            q, k, v, state, A_log, a_gate, dt_bias, b_gate,
-            cu_seqlens, scale, output, new_state, N);
-    };
-"""
-        warmup = """
-    for (int i = 0; i < 2; i++) {
-        switch (sf) {
-            case 8:  launch(gdn_prefill_kernel<8>); break;
-            case 4:  launch(gdn_prefill_kernel<4>); break;
-            case 2:  launch(gdn_prefill_kernel<2>); break;
-            default: launch(gdn_prefill_kernel<1>); break;
-        }
-    }
-"""
-        profiled = """
-    switch (sf) {
-        case 8:  launch(gdn_prefill_kernel<8>); break;
-        case 4:  launch(gdn_prefill_kernel<4>); break;
-        case 2:  launch(gdn_prefill_kernel<2>); break;
-        default: launch(gdn_prefill_kernel<1>); break;
-    }
-"""
-    else:
-        if uses_dynamic_smem:
-            launch_config = """
-    dim3 grid(N * NUM_V_HEADS);
-    dim3 block(HEAD_DIM);
-    size_t smem_bytes =
-        (HEAD_DIM * HEAD_DIM + NUM_WARPS * ROW_TILE + ROW_TILE + HEAD_DIM) * sizeof(float);
-    cudaFuncSetAttribute(
-        gdn_prefill_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem_bytes);
-"""
-            launch_helper = """
-    auto launch = [&]() {
-        gdn_prefill_kernel<<<grid, block, smem_bytes>>>(
-            q, k, v, state, A_log, a_gate, dt_bias, b_gate,
-            cu_seqlens, scale, output, new_state, N);
-    };
-"""
-        else:
-            launch_config = """
-    dim3 grid(N * NUM_V_HEADS);
-    dim3 block(HEAD_DIM);
-"""
-            launch_helper = """
-    auto launch = [&]() {
-        gdn_prefill_kernel<<<grid, block>>>(
-            q, k, v, state, A_log, a_gate, dt_bias, b_gate,
-            cu_seqlens, scale, output, new_state, N);
-    };
-"""
-        warmup = """
-    for (int i = 0; i < 2; i++) {
-        launch();
-    }
-"""
-        profiled = """
-    launch();
-"""
-
-    return (
-        PREFILL_MAIN_TEMPLATE.replace("$$KERNEL$$", prefill_kernel)
-        .replace("$$PREFILL_LAUNCH_CONFIG$$", launch_config.rstrip())
-        .replace("$$PREFILL_LAUNCH_HELPER$$", launch_helper.rstrip())
-        .replace("$$PREFILL_WARMUP$$", warmup.rstrip())
-        .replace("$$PREFILL_PROFILED$$", profiled.rstrip())
-    )
-
-
-@app.function(image=image, gpu="B200:1", timeout=600)
-def profile(decode_src: str, prefill_src: str, config: dict):
-    import subprocess, os, tempfile
-
-    build_dir = tempfile.mkdtemp()
-    sections = config["sections"]
-    section_args = []
-    for s in sections:
-        section_args.extend(["--section", s])
-
-    all_results = {}
-
-    # ──── DECODE ────
-    if "decode" in config and config["decode"].get("batch_sizes"):
-        decode_kernel = extract_kernel(decode_src, "decode")
-        main_src = DECODE_MAIN_TEMPLATE.replace("$$KERNEL$$", decode_kernel)
-        main_path = os.path.join(build_dir, "decode_main.cu")
-        with open(main_path, "w") as f:
-            f.write(main_src)
-
-        print("=== Compiling DECODE ===")
-        comp = subprocess.run(
-            ["nvcc", "-arch=sm_100a", "-O3", "-lineinfo",
-             "-lcurand", "-o", f"{build_dir}/profile_decode", main_path],
-            capture_output=True, text=True
+    print(f"Profiling {definition_name}: {len(workload_traces)} workloads")
+    print(f"Kernel filter: {kernel_name}")
+    print(f"Sections: {SECTIONS}")
+    if definition_name == PREFILL_DEFINITION:
+        print(f"Device SM count: {sm_count}")
+        print(
+            "Prefill dispatch counts: "
+            f"micro2={dispatch_counts.get('micro2', 0)}, "
+            f"4-row={dispatch_counts.get('4-row', 0)}, "
+            f"8-row={dispatch_counts.get('8-row', 0)}, "
+            f"long16={dispatch_counts.get('long16', 0)}"
         )
-        if comp.returncode != 0:
-            print(f"DECODE COMPILE FAILED:\n{comp.stderr}")
-        else:
-            print("Decode compilation OK")
-            for B in config["decode"]["batch_sizes"]:
-                print(f"\n{'='*60}")
-                print(f"  DECODE  B={B}")
-                print(f"{'='*60}")
-                prof = subprocess.run(
-                    ["ncu", "--kernel-name", "gdn_decode_kernel",
-                     "--launch-skip", "3", "--launch-count", "1"]
-                    + section_args +
-                    [f"{build_dir}/profile_decode", str(B)],
-                    capture_output=True, text=True, timeout=120
+        print(f"Selected prefill path: {prefill_path}")
+
+    results = {}
+    for i, trace in enumerate(workload_traces):
+        workload = trace.workload
+        axes_parts = [f"{k}={v}" for k, v in workload.axes.items()]
+        if definition_name == PREFILL_DEFINITION:
+            axes_parts.insert(
+                0, f"dispatch={classify_prefill_dispatch(workload.axes['num_seqs'], sm_count)}"
+            )
+        axes_str = ", ".join(axes_parts)
+        print(f"\n{'='*60}")
+        print(f"  [{i+1}/{len(workload_traces)}] {axes_str}")
+        print(f"{'='*60}")
+
+        with tempfile.TemporaryDirectory(prefix="ncu_") as data_dir:
+            data_path = Path(data_dir)
+            (data_path / "definition.json").write_text(definition.model_dump_json())
+            (data_path / "solution.json").write_text(solution.model_dump_json())
+            (data_path / "workload.json").write_text(workload.model_dump_json())
+
+            # Build NCU command: use --kernel-name + --launch-skip instead of NVTX
+            cmd = ["ncu", "--page", "details", "--kernel-name", kernel_name,
+                   "--launch-skip", "1", "--launch-count", "1", "-f"]
+            for s in SECTIONS:
+                cmd.extend(["--section", s])
+            cmd.extend([
+                sys.executable, "-u", "-m",
+                "flashinfer_bench.agents._solution_runner",
+                "--data-dir", data_dir,
+                "--device", "cuda:0",
+                "--trace-set-path", TRACE_SET_PATH,
+            ])
+
+            try:
+                result = subprocess.run(
+                    cmd, capture_output=True, text=True, timeout=300
                 )
-                print(prof.stdout)
-                if prof.stderr:
-                    print(f"STDERR: {prof.stderr[:300]}")
-                all_results[f"decode_B{B}"] = prof.stdout
+                output = result.stdout + result.stderr
+                print(output)
+                results[workload.uuid[:8]] = output
+            except subprocess.TimeoutExpired:
+                print(f"TIMEOUT after 300s")
+                results[workload.uuid[:8]] = "TIMEOUT"
 
-    # ──── PREFILL ────
-    if "prefill" in config and config["prefill"].get("workloads"):
-        prefill_kernel = extract_kernel(prefill_src, "prefill")
-        main_src = build_prefill_main(prefill_kernel)
-        main_path = os.path.join(build_dir, "prefill_main.cu")
-        with open(main_path, "w") as f:
-            f.write(main_src)
+    return results
 
-        print("\n=== Compiling PREFILL ===")
-        comp = subprocess.run(
-            ["nvcc", "-arch=sm_100a", "-O3", "-lineinfo",
-             "-lcurand", "-o", f"{build_dir}/profile_prefill", main_path],
-            capture_output=True, text=True
-        )
-        if comp.returncode != 0:
-            print(f"PREFILL COMPILE FAILED:\n{comp.stderr}")
-        else:
-            print("Prefill compilation OK")
-            for (N, T_per) in config["prefill"]["workloads"]:
-                print(f"\n{'='*60}")
-                print(f"  PREFILL  N={N}, T={T_per}")
-                print(f"{'='*60}")
-                prof = subprocess.run(
-                    ["ncu", "--kernel-name", "gdn_prefill_kernel",
-                     "--launch-skip", "2", "--launch-count", "1"]
-                    + section_args +
-                    [f"{build_dir}/profile_prefill", str(N), str(T_per)],
-                    capture_output=True, text=True, timeout=300
-                )
-                print(prof.stdout)
-                if prof.stderr:
-                    print(f"STDERR: {prof.stderr[:300]}")
-                all_results[f"prefill_N{N}_T{T_per}"] = prof.stdout
 
-    return all_results
+def classify_prefill_dispatch(num_seqs: int, sm_count: int) -> str:
+    """Mirror the live prefill wrapper's dispatch thresholds."""
+    default_grid_blocks = num_seqs * NUM_V_HEADS * (HEAD_DIM // DEFAULT_STATE_TILE_ROWS)
+    small_grid_blocks = num_seqs * NUM_V_HEADS * (HEAD_DIM // SMALL_STATE_TILE_ROWS)
+    tiny_grid_blocks = num_seqs * NUM_V_HEADS * (HEAD_DIM // TINY_STATE_TILE_ROWS)
+    if tiny_grid_blocks < (4 * sm_count):
+        return "micro2"
+    if small_grid_blocks < (2 * sm_count):
+        return "4-row"
+    if default_grid_blocks < sm_count:
+        return "8-row"
+    return "long16"
+
+
+def resolve_kernel_name(definition_name: str, prefill_path: str) -> str:
+    """Pick the NCU kernel-name regex for the current target."""
+    if definition_name == PREFILL_DEFINITION:
+        return PREFILL_KERNEL_REGEX[prefill_path]
+    return KERNEL_NAMES.get(definition_name, "kernel")
+
+
+def pack_subfolder(subfolder: str) -> Solution:
+    """Pack a subfolder's solution."""
+    import scripts.pack_solution as ps
+    ps.PROJECT_ROOT = PROJECT_ROOT / subfolder
+    solution_path = ps.pack_solution()
+    return Solution.model_validate_json(solution_path.read_text())
 
 
 @app.local_entrypoint()
-def main(kernel: str = "both"):
-    """Profile GDN kernels. Use --kernel decode|prefill|both."""
-    decode_path = PROJECT_ROOT / "gdn_decode_qk4_v8_d128_k_last" / "solution" / "cuda" / "kernel.cu"
-    prefill_path = PROJECT_ROOT / "gdn_prefill_qk4_v8_d128_k_last" / "solution" / "cuda" / "kernel.cu"
+def main(kernel: str = "both", max_workloads: int = 0, prefill_path: str = "all"):
+    """Profile GDN kernels with NCU.
 
-    config = {"sections": PROFILE_CONFIG["sections"]}
+    Args:
+        kernel: Which kernel to profile (decode, prefill, both).
+        max_workloads: Max workloads to profile per kernel (0 = all).
+        prefill_path: Prefill dispatch path to profile (all, micro2, long16).
+    """
+    if prefill_path not in VALID_PREFILL_PATHS:
+        print(
+            f"Unknown prefill path: {prefill_path}. "
+            f"Use one of: {', '.join(VALID_PREFILL_PATHS)}."
+        )
+        return
 
-    if kernel in ("decode", "both"):
-        config["decode"] = PROFILE_CONFIG["decode"]
-    if kernel in ("prefill", "both"):
-        config["prefill"] = PROFILE_CONFIG["prefill"]
+    targets = {
+        "decode": "gdn_decode_qk4_v8_d128_k_last",
+        "prefill": "gdn_prefill_qk4_v8_d128_k_last",
+    }
 
-    decode_src = decode_path.read_text() if "decode" in config else ""
-    prefill_src = prefill_path.read_text() if "prefill" in config else ""
+    if kernel == "both":
+        to_profile = list(targets.items())
+    elif kernel in targets:
+        to_profile = [(kernel, targets[kernel])]
+    else:
+        print(f"Unknown kernel: {kernel}. Use decode, prefill, or both.")
+        return
 
-    print(f"Profiling: {kernel}")
-    if "decode" in config:
-        print(f"  Decode batch sizes: {config['decode']['batch_sizes']}")
-    if "prefill" in config:
-        print(f"  Prefill workloads:  {config['prefill']['workloads']}")
-    print(f"  NCU sections:       {config['sections']}")
+    for name, subfolder in to_profile:
+        print(f"\n=== Packing {name} solution ===")
+        solution = pack_subfolder(subfolder)
+        print(f"  {solution.name} ({solution.definition})")
 
-    results = profile.remote(decode_src, prefill_src, config)
-    if not results:
-        print("No results returned!")
+        print(f"\n=== Profiling {name} on Modal B200 ===")
+        results = profile.remote(solution, max_workloads, prefill_path)
+        if not results:
+            print(f"No results for {name}!")

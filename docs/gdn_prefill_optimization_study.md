@@ -1,567 +1,402 @@
-# GDN Prefill Kernel Optimization Study
+# GDN Prefill Optimization Study
+
+Updated: 2026-04-08
 
 ## Scope
 
-This document analyzes the current `gdn_prefill_qk4_v8_d128_k_last` implementation and lists optimization directions that are worth trying on NVIDIA B200.
+This document replaces the older stale study and re-analyzes the current
+`gdn_prefill_qk4_v8_d128_k_last` implementation using:
 
-Investigation tracks:
+- the current kernel source
+- the current prefill optimization log and benchmark history
+- the current workload set
+- the current Blackwell/B200 baseline signal in the contest repo
+- official Blackwell / CUDA documentation and the Gated Delta Networks paper
 
-1. B200 / Blackwell hardware characteristics relevant to this kernel
-2. GDN prefill workload characteristics in this repo
-3. Current CUDA kernel structure and bottlenecks
-4. Optimization methods synthesized from 1-3
-5. Applicability assessment against the current implementation
+The goal is not to repeat every historical idea. The goal is to identify what is
+still worth trying now.
 
 ## Agent Team
 
-The analysis was split into three roles:
+The analysis was split into four roles:
 
-1. `Hardware agent`: B200 / Blackwell tuning characteristics and CUDA feature survey
-2. `Workload agent`: GDN prefill math, tensor layout, workload distribution, and algorithmic constraints
-3. `Kernel agent`: current CUDA implementation, bottlenecks, and implementation feasibility
+1. `Hardware agent`
+   - B200 / Blackwell features, compiler constraints, and what is realistic in
+     the current codebase
+2. `Model agent`
+   - GDN recurrence, workload structure, grouped-value-attention reuse, and
+     chunking constraints
+3. `Kernel agent`
+   - current CUDA implementation, live dispatch paths, and ideas already ruled
+     out by the optimization log
+4. `Integrator`
+   - merge the above into a ranked methodology list and applicability assessment
+
+## Sources Reviewed
+
+### Local repo
+
+- `gdn_prefill_qk4_v8_d128_k_last/solution/cuda/kernel.cu`
+- `logs/prefill/optimization_log.md`
+- `logs/prefill/bench_history.jsonl`
+- `mlsys26-contest/definitions/gdn/gdn_prefill_qk4_v8_d128_k_last.json`
+- `mlsys26-contest/workloads/gdn/gdn_prefill_qk4_v8_d128_k_last.jsonl`
+- `mlsys26-contest/solutions/baseline/gdn/gdn_prefill_qk4_v8_d128_k_last/flashinfer_wrapper_123ca6.json`
+- `docs/gemini_gdn_prefill_b200.md`
+- `scripts/profile_kernel.py`
+
+### External references
+
+- NVIDIA Blackwell Tuning Guide:
+  https://docs.nvidia.com/cuda/blackwell-tuning-guide/index.html
+- CUDA C++ Programming Guide:
+  https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html
+- CUDA cluster launch control:
+  https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#cluster-launch-control
+- CUTLASS Blackwell functionality:
+  https://docs.nvidia.com/cutlass/latest/media/docs/cpp/blackwell_functionality.html
+- NVIDIA Blackwell family-specific feature blog:
+  https://developer.nvidia.com/blog/nvidia-blackwell-and-nvidia-cuda-12-9-introduce-family-specific-architecture-features/
+- Gated Delta Networks paper:
+  https://arxiv.org/abs/2412.06464
+- Official GatedDeltaNet repo:
+  https://github.com/NVlabs/GatedDeltaNet
 
 ## Current Repo State
 
-The real work-in-progress prefill kernel is:
+### Active implementation
+
+The real prefill kernel is:
 
 - `gdn_prefill_qk4_v8_d128_k_last/solution/cuda/kernel.cu`
 
-The top-level `solution/cuda/kernel.cu` is still only a template and is not relevant for the current prefill implementation.
+The current best committed quick result in the log is:
 
-Current optimization log status:
+- Iteration 29
+- `mean_speedup = 170.18544`
+- `mean_latency_ms = 3.05327`
 
-- `logs/prefill/optimization_log.md`: header only, no recorded iterations
-- `logs/decode/optimization_log.md`: exists, but this document focuses on prefill
+The latest attempt after that was:
 
-This means the present optimization plan must be inferred from code and workload definitions rather than prior measured experiments.
+- Iteration 30
+- `q/k` pair-load vectorization on the micro path
+- correctness passed
+- weighted speedup regressed
+- decision: revert
 
-## GDN Prefill Workload Characterization
+### Optimization history is now rich, not empty
 
-### Math and state structure
+The prefill log now contains 30 measured iterations. That matters because many
+candidate ideas that looked attractive in older studies have already been tested
+and rejected.
 
-From the definition:
+### Live dispatch paths under the current wrapper
 
-- Q heads: 4
-- K heads: 4
-- V heads: 8
-- Head size: 128
-- State layout: `[num_seqs, num_v_heads, 128, 128]` in `float32`
-- Output layout: `[total_seq_len, num_v_heads, 128]` in `bfloat16`
+The current host wrapper dispatches by `num_seqs` only:
 
-Reference implementation structure:
+- `N <= 2` effectively lands on the `2-row micro` path
+- `N >= 3` effectively lands on the `16-row default` path
 
-1. Compute `g = exp(-exp(A_log) * softplus(a + dt_bias))`
-2. Compute `beta = sigmoid(b)`
-3. For each sequence and timestep, decay old state
-4. Compute `old_v = k @ old_state`
-5. Update with rank-1 form using `k^T @ residual`
-6. Emit `output = scale * q @ state_new`
+Applying the current wrapper logic to the 100 contest workloads gives:
 
-Important consequence:
+- `61/100` workloads on `micro2`
+- `39/100` workloads on `default16`
 
-- Prefill is sequential along time within each sequence. There is no legal parallelization across timesteps of the same sequence without reformulating the algorithm.
-- The kernel is dominated by repeated operations on a `128 x 128` fp32 state per `(sequence, v_head)`.
+For the actual workload set, the `4-row` and `8-row` kernels are effectively dead
+paths today.
 
-### GVA mapping
+### Profiling caveat
 
-The workload uses grouped value attention style mapping:
+The checked-in `scripts/profile_kernel.py` does not mirror the current host
+wrapper dispatch. For templated prefill kernels it still hardcodes an older
+`gdn_prefill_kernel<8|4|2|1>` launch scheme inside the profiling harness instead
+of calling the current wrapper logic.
 
-- `num_q_heads = num_k_heads = 4`
-- `num_v_heads = 8`
-- Therefore each q/k head serves two v-heads
+Implication:
 
-This creates a reuse opportunity:
+- fresh NCU runs from that script are still useful for broad launch/occupancy
+  intuition
+- but they are not an exact profile of the current end-to-end dispatch behavior
 
-- For two `v_head`s that map to the same `qkh`, the same `q` and `k` vectors are read and converted twice in the current implementation.
+For current-path decisions, the latest notes embedded in
+`logs/prefill/optimization_log.md` are more reliable than the profiling harness as
+it stands.
 
-### Workload distribution
+## Current Implementation Summary
 
-The workload file contains 100 cases. Local aggregation of `mlsys26-contest/workloads/gdn/gdn_prefill_qk4_v8_d128_k_last.jsonl` shows:
+### Common math
 
-- `total_seq_len`: min 6, max 8192, median 139, mean 1830.65
-- `num_seqs`: min 1, max 57, median 2, mean 7.97
-- 16 workloads have `total_seq_len = 8192`
-- 18 workloads have `total_seq_len >= 4000`
-- 16 workloads have `num_seqs >= 16`
-- 56 workloads have `total_seq_len < 256`
+Per token and per value head, the kernel computes:
 
-Interpretation:
+1. `g = exp(-exp(A_log) * softplus(a + dt_bias))`
+2. `beta = sigmoid(b)`
+3. `temp = g * state`
+4. `kdot = k @ temp`
+5. `residual = beta * (v - kdot)`
+6. `state_new = temp + k^T @ residual`
+7. `output = scale * (q @ state_new)`
 
-- There is a long tail of short cases, so launch overhead and over-specialized kernels can matter.
-- But a meaningful portion of the evaluation set is large enough that steady-state throughput on the recurrent state update likely dominates total runtime.
-- A good solution probably needs at least two regimes:
-  - short / low-parallelism path
-  - long / high-parallelism path
+This recurrence is sequential within each sequence. There is no legal naive
+token-parallel prefill path without reformulating the algorithm.
 
-## Current Kernel Strategy
+### Short path: `2-row micro warp-per-row`
 
-The current CUDA prefill kernel launches:
+The current short path is the Iteration 29 kernel:
 
-- one block per `(seq, v_head)`
-- 128 threads per block
-- one thread per `K` dimension
+- one warp owns one state row
+- each lane owns four `K` columns
+- the kernel uses warp shuffles instead of cross-warp shared-memory reductions
+- this removed the biggest low-`N` barrier bottleneck and produced the current
+  largest measured improvement
 
-The full `128 x 128` state matrix for a `(seq, v_head)` tile is loaded into shared memory once, updated token-by-token, and written back at the end.
+This is the strongest part of the current implementation.
 
-### What the kernel does well
+### Long path: `16-row shared-memory scalar kernel`
 
-1. It avoids reloading the recurrent state from global memory at every timestep.
-2. It keeps the time-recursive update within a single block, which is semantically simple and correct.
-3. It matches the natural `K=128` thread mapping for dot products over the key dimension.
+The current long path still:
 
-### What the kernel does poorly
+- stages a `16 x 128` state tile in shared memory
+- computes `k @ temp` via cross-warp reduction to shared memory
+- computes `q @ state_new` via another reduction path
+- serializes the final accumulation through `tid == 0`
 
-1. It uses a large dynamic shared memory allocation:
-   - state: `128 * 128 * 4 = 65536` bytes
-   - scratch: about `1040` bytes
-   - total: about `66.6 KB` per block
-2. It computes `k @ state` using a loop over all 128 output rows, with a block-wide reduction and full-block synchronization for every row.
-3. It computes `q @ state_new` with another full loop over all 128 rows, again with repeated full-block synchronization.
-4. It serializes the whole sequence inside one block, so each `(seq, v_head)` contributes only one block of parallelism regardless of sequence length.
-5. It reloads `q`, `k`, and gates separately for the two `v_head`s that share the same `qkh`.
+It is much better than the old full-state kernel, but it is still a scalar
+recurrent kernel, not a Blackwell-native tiled kernel.
 
-## Bottleneck Analysis Against Current Code
+## What The History Already Established
 
-### 1. Synchronization-heavy inner loops
+### Proven wins
 
-The worst bottleneck is repeated block-wide synchronization in the innermost loops.
+These ideas already worked:
 
-In `gdn_prefill_qk4_v8_d128_k_last/solution/cuda/kernel.cu`:
+- row tiling instead of one CTA owning the full `128 x 128` state
+- deeper low-`N` fallback so short workloads get more CTAs
+- removing a redundant end-of-timestep CTA barrier
+- rewriting the `2-row` path into a warp-per-row micro kernel
 
-- lines 107-122 compute `s_kdot[vi]` for each `vi`
-- lines 125-143 compute output for each `vi`
+### Repeated regressions or dead ends
 
-For each token:
+These are currently low-ROI to revisit without a materially different structure:
 
-- 128 iterations for `k @ state`
-- 128 iterations for `q @ state_new`
-- multiple `__syncthreads()` inside both loops
+- more `4/8/1/32-row` launch-heuristic tuning
+- vectorization-only patches for state I/O or micro `q/k` loads
+- register tiling in the current micro or `4-row` scalar paths
+- `launch_bounds` tuning on the current templated long path
+- reviving the currently dead `4-row` or `8-row` kernels
 
-That is structurally expensive even before considering math throughput.
+### Correctness failures
 
-### 2. Under-utilization due to one block per `(seq, v_head)`
+These should be treated as unsafe until the math is reformulated more carefully:
 
-The current mapping gives grid size:
+- algebraic output fusion of the form
+  `q @ state_new = q @ temp + (q · k) * residual`
 
-- `num_seqs * 8`
+That family already failed correctness multiple times in the quick benchmark log.
 
-For small `num_seqs`, the GPU is underfilled. This is acute because many workloads have `num_seqs <= 3`.
+## B200 + GDN Synthesis
 
-For long sequences, the work remains trapped in a single block per head because the sequential time loop is inside the block:
+### What GDN says
 
-- lines 93-145
+GDN prefill is fundamentally a recurrent state update. That means:
 
-So long sequences do not create more parallelism, only longer block residency.
+- direct timestep parallelization is not available
+- the only path to substantially more GPU parallelism is a chunked reformulation
+- grouped-value attention (`q_heads = k_heads = 4`, `v_heads = 8`) creates a real
+  reuse opportunity because sibling value heads share the same `q/k` head
 
-### 3. Shared-memory pressure limits occupancy
+### What B200 says
 
-The kernel opts into about 66.6 KB dynamic shared memory per block:
+Blackwell/B200 offers strong upside for:
 
-- lines 177-180
+- chunked tile-level matrix pipelines
+- TMA-style bulk async movement
+- TMEM / `tcgen05` / CUTLASS-CuTe Blackwell paths
+- persistent scheduling and cluster-level execution once work is tiled
 
-On Blackwell compute capability 10.0, the shared-memory-per-SM ceiling is 228 KB and per-block ceiling is 227 KB. This kernel fits easily, but the per-block footprint still restricts active blocks per SM.
+But those features are not free wins on a scalar recurrent raw-CUDA loop. They
+become valuable only after the kernel is rewritten to expose tile-level work.
 
-This is not catastrophic on B200, but it means occupancy is constrained before register pressure is even considered.
+### Strong directional signal from the contest baseline
 
-### 4. Scalar transcendental gate computation in the token loop
+The contest baseline for this exact definition is not a token-serial scalar kernel.
+It is a Blackwell-specific `chunk_gated_delta_rule` implementation with:
 
-Per token, per block, the kernel computes:
+- chunk size 128
+- persistent and non-persistent modes
+- CuTe / CUTLASS / SM100 Blackwell machinery
 
-- `softplus`
-- `expf`
-- `sigmoid`
+That is the strongest available repo-local signal for the long-term architecture.
 
-This is not the dominant cost relative to the `128 x 128` state math, but for short sequences it is not free. It also makes the short-case path more latency-sensitive.
+## Best Current-Code Experiments
 
-### 5. Duplicate q/k work across paired v-heads
+These are ideas that are still worth trying without throwing away the current CUDA
+kernel family.
 
-The mapping `qkh = vh / 2` means `vh=0,1` share the same q/k head, `vh=2,3` share another, etc.
+### 1. Precompute `g` and `beta` once per `(t, v_head)`
 
-In the current kernel:
+Why it is interesting:
 
-- `q` and `k` are loaded separately by each `v_head` block
-- the same bf16-to-fp32 conversions are repeated
+- the current row-tiled kernels recompute the same gate values independently in
+  every row-tile CTA
+- on the live `2-row micro` path, that means the same `(t, vh)` gate is computed
+  across 64 row tiles
+- on the `16-row` path, it is still recomputed across 8 row tiles
+- B200 is especially asymmetric between massive math throughput and much weaker
+  transcendental/SFU throughput, so moving gate generation out of the hot update
+  kernel is structurally attractive
 
-That is a clean reuse opportunity if the execution mapping changes.
+Why it fits GDN:
 
-### 6. No measurement infrastructure for prefill yet
-
-There is no recorded prefill optimization history and no checked-in prefill profiling results:
-
-- no NCU snapshots
-- no occupancy reports
-- no correctness/perf deltas by attempt
-
-This is a process bottleneck rather than a kernel bottleneck, but it matters because several candidate optimizations require quick reject/accept cycles.
-
-## B200 / Blackwell Characteristics That Matter Here
-
-From the current Blackwell tuning guidance:
-
-1. Compute capability 10.0 supports up to 64 resident warps per SM and 32 thread blocks per SM.
-2. Shared memory per SM is 228 KB, with up to 227 KB addressable by a single block after opt-in.
-3. Blackwell supports thread block clusters and distributed shared memory.
-4. B200 supports runtime shared-memory carveout tuning.
-5. Blackwell keeps the Hopper-style model where advanced architecture-specific or family-specific features may require dedicated compiler targets.
-
-Why this matters here:
-
-- The current kernel already relies on large dynamic shared memory, so Blackwell is a better fit than older architectures.
-- However, this kernel is not currently exploiting the features that would differentiate B200 from a conventional shared-memory implementation.
-- In particular, the current kernel does not exploit tensor-core MMA style decomposition, clustered execution, or family-specific code generation.
-
-## Candidate Optimization Methods
-
-The list below combines hardware opportunities and workload-specific structure.
-
-### A. Split the kernel into at least two execution regimes
-
-Idea:
-
-- Use one kernel strategy for short sequences / small `num_seqs`
-- Use another for long sequences / large `num_seqs`
-
-Why it fits:
-
-- The workload distribution is bimodal enough to justify specialization.
-- The current single strategy is poor for both extremes.
+- `g` and `beta` depend only on input tensors and per-head parameters, not on the
+  recurrent state
+- therefore they are legal to precompute
 
 Applicability now:
 
-- High
+- high
+- moderate implementation effort
+- good candidate for the next single experiment
 
-Expected implementation effort:
+Correctness notes:
 
-- Moderate
+- keep `g` and `beta` in fp32
+- preserve the exact gate formula first before trying any approximation
 
-Comments:
+### 2. Rewrite only the `16-row` long path around warp-owned row groups
 
-- This is likely the safest first structural improvement.
-- Even a simple threshold on `seq_len` or `total_seq_len / num_seqs` is worth trying.
+Why it is interesting:
 
-### B. Warp-specialize the two inner loops to reduce full-block barriers
-
-Idea:
-
-- Replace block-wide reductions plus `__syncthreads()` per row with warp-scoped decomposition and fewer full-block sync points.
-- Use multiple warps to cooperatively process different `vi` rows.
-
-Why it fits:
-
-- The current kernel spends a large fraction of its control flow in repeated reduction + barrier patterns.
+- the biggest remaining structural weakness is no longer the short path
+- the current long path still spends substantial control flow on cross-warp
+  shared-memory reductions and `tid == 0` serialization
+- the micro path already demonstrated that warp-local ownership is the right style
+  for this problem family
 
 Applicability now:
 
-- High
+- medium
+- more invasive than a scalar cleanup, but still within the current kernel family
 
-Expected implementation effort:
+What to preserve:
 
-- Moderate to high
+- do not reintroduce algebraic output fusion
+- change mapping and reduction structure, not the math
 
-Comments:
+### 3. Reuse `q/k` across sibling value heads
 
-- This is the most directly applicable optimization without changing algorithm semantics.
-- The current `(128 threads, K=128)` mapping is already warp-aligned; the main issue is decomposition.
+Why it is interesting:
 
-### C. Tile the state matrix instead of iterating one `vi` row at a time
-
-Idea:
-
-- Process the `128 x 128` state in tiles, for example `64 x 64`, `64 x 128`, or `32 x 128`.
-- Accumulate partial `k @ state` and `q @ state_new` over tiles.
-
-Why it fits:
-
-- The kernel currently serializes the `V=128` dimension in software loops.
-- Tiling can expose more instruction-level parallelism and reduce synchronization frequency.
+- grouped-value attention means two `v_head`s share one `q/k` head
+- the current implementation duplicates `q/k` loads and bf16-to-f32 conversions
+  across those sibling heads
 
 Applicability now:
 
-- High
+- medium
+- best targeted at the long path, not the underfilled short micro path
 
-Expected implementation effort:
+Important caveat:
 
-- High
+- mapping one CTA to two value heads can cut grid density in half, which is bad on
+  the already underfilled short path
+- this is therefore better as a long-path reuse optimization than as a micro-path
+  change
 
-Comments:
+## Best Rewrite-Level Directions
 
-- This is the natural path toward a more tensor-core-friendly decomposition as well.
+These are the methods most aligned with B200, but they are not incremental
+patches.
 
-### D. Fuse the paired `v_head`s that share the same q/k head
+### 1. Keep the current micro short path, replace the long path with chunked GDN prefill
 
-Idea:
+Recommended architecture:
 
-- Compute two `v_head`s together inside one block or cooperative group because they share the same `q` and `k`.
+- keep the Iteration 29 micro kernel for the short/low-`N` regime
+- add a new chunked long path for larger or longer workloads
+- start with `chunk_size = 128`, because that is the strongest signal from the
+  baseline and from the fixed `head_dim = 128`
 
-Why it fits:
+Why this is the best overall direction:
 
-- `NUM_V_HEADS = 8`, `NUM_Q_HEADS = NUM_K_HEADS = 4`
-- Each `qkh` serves exactly two value heads
-
-Benefits:
-
-- Reuse of `q` / `k`
-- Less redundant bf16 conversion
-- Better arithmetic intensity
-
-Applicability now:
-
-- Medium to high
-
-Expected implementation effort:
-
-- Moderate
-
-Comments:
-
-- This is one of the cleanest workload-specific optimizations.
-- It may increase register or shared-memory pressure, so it should be paired with occupancy checks.
-
-### E. Precompute or hoist gate terms where possible
-
-Idea:
-
-- Reduce recomputation of `expf`, `softplus`, and `sigmoid`
-- Possibly precompute `g` and `beta` in a lightweight preprocessing pass or fuse more cheaply into the main loop
+- it respects GDN recurrence semantics
+- it is the first structure that can actually unlock B200-specific tensor/memory
+  features
+- it avoids spending more time on launch-heuristic microtuning that the log has
+  already mostly exhausted
 
 Applicability now:
 
-- Medium
+- high at the repo strategy level
+- low as a small patch
 
-Expected implementation effort:
+### 2. Add persistent scheduling only after chunking or true tile decomposition
 
-- Low to moderate
+Why it is interesting:
 
-Comments:
+- workload lengths are highly uneven
+- static assignment wastes hardware once short tiles finish
 
-- Useful mostly for short-sequence latency.
-- Not likely the top throughput win for long-sequence heavy cases.
+Why it is not first:
 
-### F. Use vectorized loads and conversion-friendly packing for q/k/v
+- in the current scalar recurrence structure, there is not enough movable work to
+  justify the complexity
+- it becomes natural only after chunk or tile decomposition exists
 
-Idea:
+### 3. Use CuTe/CUTLASS Blackwell paths only after the algorithm is in chunk form
 
-- Load `bf16` values in packed form where alignment permits
-- Reduce instruction count around scalar conversion
+This includes:
 
-Applicability now:
+- TMA-style movement
+- TMEM / `tcgen05`
+- Blackwell family-specific code generation
+- warp-specialized producer/consumer pipelines
 
-- Medium
+These are attractive, but only after the long path becomes a tile pipeline instead
+of a token-serial scalar loop.
 
-Expected implementation effort:
+## Recommended Ranking
 
-- Moderate
+### Highest-value direct experiments
 
-Comments:
+1. precompute `g` and `beta` once per `(t, vh)`
+2. warp-specialized rewrite of the `16-row` long path
+3. sibling-`v_head` `q/k` reuse on the long path
 
-- This is a secondary optimization and should follow structural fixes.
+### Highest-value architectural directions
 
-### G. Rebuild around tensor-core MMA / tile programming
+1. keep current micro short path, add chunked long path
+2. persistent scheduler after chunking
+3. CuTe/CUTLASS Blackwell path after chunking
 
-Idea:
+## Not Recommended Right Now
 
-- Reformulate the `k @ state` and `q @ state_new` operations as matrix fragments suitable for tensor-core execution.
-- Potentially use CUTLASS/CUTE-style tile decomposition or lower-level family-specific Blackwell paths.
+Avoid spending more cycles on the following unless the surrounding architecture
+changes first:
 
-Why it is attractive:
-
-- The recurrent core repeatedly performs dense dot-product style math on fixed `128 x 128` state blocks.
-
-Why it is hard:
-
-- The update is not just GEMM; it interleaves decay, rank-1 update, and output projection.
-- A full rewrite is required.
-
-Applicability now:
-
-- Medium
-
-Expected implementation effort:
-
-- Very high
-
-Comments:
-
-- This is the highest-upside path if the goal is leaderboard-level performance.
-- It is not the best first move if the current implementation has not yet been profiled and stabilized.
-
-### H. Use thread block clusters / distributed shared memory
-
-Idea:
-
-- Spread one logical `(seq, qkh)` or `(seq, qkh pair)` computation across multiple blocks in a cluster and share intermediate state through distributed shared memory.
-
-Why it is interesting on B200:
-
-- Blackwell supports clusters and distributed shared memory.
-- B200 allows nonportable cluster size 16 with opt-in.
-
-Why it is difficult:
-
-- The current recurrence is naturally local to a single state block.
-- Clustered execution only pays off if we repartition work across blocks carefully.
-
-Applicability now:
-
-- Low to medium
-
-Expected implementation effort:
-
-- Very high
-
-Comments:
-
-- This is a second-wave experiment, not a first-wave optimization.
-
-### I. Use L2 persistence / cache control for streamed q/k/v or state-adjacent metadata
-
-Idea:
-
-- Mark frequently reused data for L2 persistence where CUDA APIs and access patterns make sense.
-
-Applicability now:
-
-- Low to medium
-
-Expected implementation effort:
-
-- Moderate
-
-Comments:
-
-- The recurrent state is already staged in shared memory for the whole sequence, so the best L2 candidates are not obvious.
-- This is more likely a minor gain than a major one.
-
-### J. Async copy / TMA-style staging for state tiles
-
-Idea:
-
-- Use asynchronous global-to-shared transfers for tiled state movement and overlap data movement with compute.
-
-Applicability now:
-
-- Medium in principle
-- Low against the current codebase
-
-Expected implementation effort:
-
-- High
-
-Comments:
-
-- This becomes more compelling only after the kernel is tiled.
-- In the current implementation, state is copied once, then reused for the whole sequence; there is not enough structured tile streaming yet to make this the first optimization.
-
-## Applicability Matrix
-
-| Method | Expected upside | Effort | Fit to current code | Notes |
-|---|---:|---:|---|---|
-| Two-regime kernel split | High | Medium | Strong | Best first structural move |
-| Warp-specialized inner loops | High | Medium-High | Strong | Directly attacks current barrier-heavy loops |
-| State tiling | High | High | Strong | Needed before more advanced pipelines |
-| Pair two v-heads per q/k head | Medium-High | Medium | Strong | Exploits workload-specific reuse |
-| Gate precompute / hoisting | Medium | Low-Medium | Strong | Helps short cases more than long ones |
-| Vectorized q/k/v loads | Medium | Medium | Medium | Secondary optimization |
-| Tensor-core MMA rewrite | Very High | Very High | Medium | Likely required for top-end performance |
-| Thread block clusters / DSM | Medium | Very High | Weak-Medium | B200-specific but structurally invasive |
-| L2 persistence hints | Low-Medium | Medium | Weak | Likely incremental only |
-| Async copy / TMA pipeline | Medium-High | High | Weak-Medium | Depends on first introducing tiles |
-
-## What Is Immediately Applicable to the Current Kernel
-
-These are the optimizations that can be attempted without first redesigning the whole kernel around a new programming model:
-
-1. Split into short-path and long-path kernels
-2. Reduce full-block synchronizations in the two `vi` loops
-3. Fuse paired `v_head`s sharing the same `qkh`
-4. Add vectorized input loads and cheaper conversion patterns
-5. Hoist gate-related scalar work where profitable
-
-These are likely to require a structural rewrite first:
-
-1. Tensor-core-centered implementation
-2. Async tiled pipeline
-3. Thread block cluster / distributed shared memory decomposition
-
-## Recommended Optimization Roadmap
-
-### Phase 0: Measurement baseline
-
-Before changing math structure, add actual prefill measurements:
-
-1. correctness on representative short and long workloads
-2. latency breakdown by workload bucket
-3. Nsight Compute capture for one short case and one long case
-4. occupancy, smem usage, and barrier stall inspection
-
-Without this, the team is optimizing blind.
-
-### Phase 1: Safe structural improvements
-
-Recommended first experiments:
-
-1. kernel split by workload regime
-2. paired-`v_head` execution
-3. warp-specialized reduction/output loops
-4. vectorized q/k/v access cleanup
-
-This phase has the best effort-to-upside ratio.
-
-### Phase 2: Stateful tile redesign
-
-If Phase 1 is insufficient:
-
-1. redesign around state tiling
-2. reduce barrier count sharply
-3. create a form that can later use async staged copies
-
-### Phase 3: B200-specific aggressive path
-
-Only after a tiled implementation exists:
-
-1. evaluate async copy / TMA-like staging
-2. evaluate tensor-core fragment mapping
-3. evaluate clustered multi-block decomposition if single-block saturation remains insufficient
-
-## Gaps in Current Evidence
-
-Current repo gaps:
-
-1. no prefill optimization history in `logs/prefill/optimization_log.md`
-2. no prefill Nsight Compute outputs
-3. no workload bucketing or summary scripts checked in
-4. no prefill correctness/performance regression tests
-5. no A/B experiments against the FlashInfer baseline documented in repo
-
-These should be fixed before major kernel rewrites, otherwise it will be difficult to know which ideas actually help.
+- more launch-only tuning of `4/8/1/32-row` variants
+- vectorization-only patches on the current paths
+- register-only tiling of the current scalar micro path
+- `launch_bounds` microtuning
+- early DSM / cluster / TMA experiments on the current scalar kernel
+- output algebraic fusion without a different numerical formulation
 
 ## Bottom Line
 
-The current prefill kernel is a correct shared-memory baseline, not a B200-tuned implementation.
+The current prefill kernel is no longer a raw baseline. It already contains one
+strong specialized path: the `2-row micro warp-per-row` kernel. That means the
+best remaining opportunities have shifted.
 
-The best methods to try next are:
+The next useful work is not "more random row-tile heuristics." It is:
 
-1. split the kernel into short and long execution regimes
-2. fuse the two `v_head`s that share one q/k head
-3. redesign the inner loops to reduce full-block barriers
-4. move toward tiled state processing
+1. one more round of structurally informed current-code experiments, led by gate
+   precompute and a real long-path mapping rewrite
+2. then a deliberate move toward a two-regime architecture:
+   `current micro short path + new chunked Blackwell long path`
 
-The highest-upside but highest-risk path is a tensor-core-oriented tiled rewrite. B200 hardware features make that attractive, but the current kernel is not yet structurally ready to benefit from the more advanced Blackwell-specific mechanisms.
+That is the cleanest synthesis of:
 
-## Sources
-
-Repo-local sources:
-
-- `gdn_prefill_qk4_v8_d128_k_last/solution/cuda/kernel.cu`
-- `gdn_decode_qk4_v8_d128_k_last/solution/cuda/kernel.cu`
-- `mlsys26-contest/definitions/gdn/gdn_prefill_qk4_v8_d128_k_last.json`
-- `mlsys26-contest/workloads/gdn/gdn_prefill_qk4_v8_d128_k_last.jsonl`
-- `logs/prefill/optimization_log.md`
-- `EVALUATION.md`
-
-External sources:
-
-- NVIDIA Blackwell Tuning Guide: https://docs.nvidia.com/cuda/blackwell-tuning-guide/index.html
-- CUDA 12.8 Blackwell support blog: https://developer.nvidia.com/blog/cuda-toolkit-12-8-delivers-nvidia-blackwell-support/
-- Blackwell family-specific feature guidance: https://developer.nvidia.com/blog/nvidia-blackwell-and-nvidia-cuda-12-9-introduce-family-specific-architecture-features/
-- Blackwell Ultra architecture overview: https://developer.nvidia.com/blog/inside-nvidia-blackwell-ultra-the-chip-powering-the-ai-factory-era/
+- the current kernel
+- the optimization log
+- the workload distribution
+- GDN algorithmic constraints
+- and what B200 is actually good at

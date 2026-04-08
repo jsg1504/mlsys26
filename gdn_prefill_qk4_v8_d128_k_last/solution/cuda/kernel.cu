@@ -38,8 +38,11 @@ constexpr int TINY_STATE_TILE_ROWS = 4;
 constexpr int MICRO_STATE_TILE_ROWS = 2;
 constexpr int MICRO_BLOCK_THREADS = 64;
 constexpr int MICRO_K_COLS_PER_LANE = HEAD_DIM / WARP_SIZE;
+constexpr int LONG_ROWS_PER_WARP = DEFAULT_STATE_TILE_ROWS / NUM_WARPS;
 
 static_assert(HEAD_DIM % WARP_SIZE == 0, "HEAD_DIM must be warp aligned");
+static_assert(DEFAULT_STATE_TILE_ROWS % NUM_WARPS == 0,
+              "Default state tile must divide evenly across warps");
 
 __device__ __forceinline__ float softplus(float x) {
     return log1pf(expf(x));
@@ -188,6 +191,145 @@ __global__ void gdn_prefill_kernel(
     // Write final state back
     #pragma unroll
     for (int r = 0; r < STATE_TILE_ROWS; r++) {
+        const int vi = vi_base + r;
+        new_state_base[vi * HEAD_DIM + tid] = s_state[r][tid];
+    }
+}
+
+/*
+ * Specialized 16-row long-path kernel.
+ * Each warp owns every NUM_WARPS-th row in the tile so the per-row dot products
+ * stay warp-local instead of serializing cross-warp reductions through tid == 0.
+ */
+__global__ void gdn_prefill_kernel_long(
+    const bf16* __restrict__ q,         // [T, 4, 128]
+    const bf16* __restrict__ k,         // [T, 4, 128]
+    const bf16* __restrict__ v,         // [T, 8, 128]
+    const float* __restrict__ state,    // [N, 8, 128, 128] k-last
+    const float* __restrict__ A_log,    // [8]
+    const bf16* __restrict__ a,         // [T, 8]
+    const float* __restrict__ dt_bias,  // [8]
+    const bf16* __restrict__ b_gate,    // [T, 8]
+    const int64_t* __restrict__ cu_seqlens, // [N+1]
+    const float scale,
+    bf16* __restrict__ output,          // [T, 8, 128]
+    float* __restrict__ new_state,      // [N, 8, 128, 128]
+    int num_seqs
+) {
+    static_assert(DEFAULT_STATE_TILE_ROWS == 16, "Long kernel assumes 16-row tiles");
+    static_assert(LONG_ROWS_PER_WARP == 4, "Long kernel assumes four rows per warp");
+
+    const int idx = blockIdx.x;
+    const int row_tile = blockIdx.y;
+    const int seq = idx / NUM_V_HEADS;
+    const int vh = idx % NUM_V_HEADS;
+    const int qkh = vh / V_PER_Q;
+    const int tid = threadIdx.x;
+    const int lane = tid & (WARP_SIZE - 1);
+    const int warp_idx = tid / WARP_SIZE;
+    const int vi_base = row_tile * DEFAULT_STATE_TILE_ROWS;
+    const int k_col_base = lane * MICRO_K_COLS_PER_LANE;
+    constexpr unsigned int kWarpMask = 0xffffffffu;
+
+    if (seq >= num_seqs) return;
+
+    const int64_t seq_start = cu_seqlens[seq];
+    const int64_t seq_end = cu_seqlens[seq + 1];
+    const int seq_len = (int)(seq_end - seq_start);
+    if (seq_len <= 0) return;
+
+    const float* state_base = state + (seq * NUM_V_HEADS + vh) * HEAD_DIM * HEAD_DIM;
+    float* new_state_base = new_state + (seq * NUM_V_HEADS + vh) * HEAD_DIM * HEAD_DIM;
+
+    __shared__ float s_state[DEFAULT_STATE_TILE_ROWS][HEAD_DIM];
+    __shared__ float s_q[HEAD_DIM];
+    __shared__ float s_k[HEAD_DIM];
+    __shared__ float s_g;
+    __shared__ float s_beta;
+
+    #pragma unroll
+    for (int r = 0; r < DEFAULT_STATE_TILE_ROWS; r++) {
+        const int vi = vi_base + r;
+        s_state[r][tid] = state_base[vi * HEAD_DIM + tid];
+    }
+    __syncthreads();
+
+    float A_exp = 0.0f;
+    float dt_val = 0.0f;
+    if (tid == 0) {
+        A_exp = expf(A_log[vh]);
+        dt_val = dt_bias[vh];
+    }
+
+    for (int t_offset = 0; t_offset < seq_len; t_offset++) {
+        if (t_offset > 0) {
+            __syncthreads();
+        }
+
+        const int t = (int)seq_start + t_offset;
+        const int qk_base = t * NUM_K_HEADS * HEAD_DIM + qkh * HEAD_DIM;
+        const int q_base = t * NUM_Q_HEADS * HEAD_DIM + qkh * HEAD_DIM;
+        s_k[tid] = __bfloat162float(k[qk_base + tid]);
+        s_q[tid] = __bfloat162float(q[q_base + tid]);
+        if (tid == 0) {
+            const float a_val = __bfloat162float(a[t * NUM_V_HEADS + vh]);
+            const float b_val = __bfloat162float(b_gate[t * NUM_V_HEADS + vh]);
+            s_g = expf(-A_exp * softplus(a_val + dt_val));
+            s_beta = 1.0f / (1.0f + expf(-b_val));
+        }
+        __syncthreads();
+
+        #pragma unroll
+        for (int group = 0; group < LONG_ROWS_PER_WARP; group++) {
+            const int r = warp_idx + group * NUM_WARPS;
+            const int vi = vi_base + r;
+            float state_vals[MICRO_K_COLS_PER_LANE];
+            float kdot_partial = 0.0f;
+
+            #pragma unroll
+            for (int c = 0; c < MICRO_K_COLS_PER_LANE; c++) {
+                const int col = k_col_base + c;
+                const float temp_val = s_g * s_state[r][col];
+                state_vals[c] = temp_val;
+                kdot_partial += s_k[col] * temp_val;
+            }
+
+            for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+                kdot_partial += __shfl_down_sync(kWarpMask, kdot_partial, offset);
+            }
+
+            float residual = 0.0f;
+            if (lane == 0) {
+                const float v_val =
+                    __bfloat162float(v[t * NUM_V_HEADS * HEAD_DIM + vh * HEAD_DIM + vi]);
+                residual = s_beta * (v_val - kdot_partial);
+            }
+            residual = __shfl_sync(kWarpMask, residual, 0);
+
+            float output_partial = 0.0f;
+            #pragma unroll
+            for (int c = 0; c < MICRO_K_COLS_PER_LANE; c++) {
+                const int col = k_col_base + c;
+                const float new_s = state_vals[c] + s_k[col] * residual;
+                s_state[r][col] = new_s;
+                output_partial += s_q[col] * new_s;
+            }
+
+            for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+                output_partial += __shfl_down_sync(kWarpMask, output_partial, offset);
+            }
+
+            if (lane == 0) {
+                output[t * NUM_V_HEADS * HEAD_DIM + vh * HEAD_DIM + vi] =
+                    __float2bfloat16(scale * output_partial);
+            }
+        }
+    }
+
+    __syncthreads();
+
+    #pragma unroll
+    for (int r = 0; r < DEFAULT_STATE_TILE_ROWS; r++) {
         const int vi = vi_base + r;
         new_state_base[vi * HEAD_DIM + tid] = s_state[r][tid];
     }
@@ -362,6 +504,28 @@ void launch_gdn_prefill_kernel_micro(
         q, k, v, state, A_log, a, dt_bias, b_gate, cu_seqlens, scale, output, new_state, num_seqs);
 }
 
+void launch_gdn_prefill_kernel_long(
+    cudaStream_t stream,
+    const bf16* q,
+    const bf16* k,
+    const bf16* v,
+    const float* state,
+    const float* A_log,
+    const bf16* a,
+    const float* dt_bias,
+    const bf16* b_gate,
+    const int64_t* cu_seqlens,
+    float scale,
+    bf16* output,
+    float* new_state,
+    int num_seqs
+) {
+    dim3 grid(num_seqs * NUM_V_HEADS, HEAD_DIM / DEFAULT_STATE_TILE_ROWS);
+    dim3 block(HEAD_DIM);
+    gdn_prefill_kernel_long<<<grid, block, 0, stream>>>(
+        q, k, v, state, A_log, a, dt_bias, b_gate, cu_seqlens, scale, output, new_state, num_seqs);
+}
+
 // TVM FFI entry point (DPS style)
 void gdn_prefill(
     tvm::ffi::TensorView q,         // [T, 4, 128] bf16
@@ -455,7 +619,7 @@ void gdn_prefill(
             new_state_ptr,
             num_seqs);
     } else {
-        launch_gdn_prefill_kernel<DEFAULT_STATE_TILE_ROWS>(
+        launch_gdn_prefill_kernel_long(
             stream,
             q_ptr,
             k_ptr,

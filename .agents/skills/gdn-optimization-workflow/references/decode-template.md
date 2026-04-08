@@ -49,7 +49,9 @@ Return pass or fail, findings by severity, and whether benchmarking is safe.
 ```text
 Run the quick Modal benchmark for decode:
 `conda run -n fi-bench modal run scripts/run_modal_subfolder.py --subfolder gdn_decode_qk4_v8_d128_k_last`
+Use the active external research mode from the research step and carry forward a short note describing whether external sources were consulted.
 Parse the benchmark output, compare it against the latest comparable committed quick benchmark baseline already in `logs/decode/bench_history.jsonl` when one exists, append a new entry to `logs/decode/bench_history.jsonl`, append a short note to `logs/decode/optimization_log.md`, and recommend `revert` or `commit`.
-The appended JSON line must include `decision` with that final recommendation.
+The appended JSON line must include `decision` with that final recommendation and `research_mode` with the active external research mode.
+The optimization-log note must mention the active research mode and whether external sources were consulted.
 Use correctness regression or no performance improvement as `revert`.
 ```

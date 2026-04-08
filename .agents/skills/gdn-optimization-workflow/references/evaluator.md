@@ -12,6 +12,8 @@ Run the quick Modal benchmark for the target kernel, append the result to the co
 - Target subfolder
 - Kernel-specific log path
 - Kernel-specific optimization log path
+- Active research mode: `local_only`, `auto`, or `required`
+- Short external research summary: either `none` or a concise note describing which external sources were consulted and why
 - A short note describing the experiment
 
 ## Required Work
@@ -29,7 +31,9 @@ Run the quick Modal benchmark for the target kernel, append the result to the co
    - If no such optimization-iteration commit exists yet, fall back to the latest available quick benchmark entry and state that bootstrap assumption explicitly.
 4. Append a new JSON line to the kernel-specific `bench_history.jsonl`.
    - Include the final workflow recommendation in that JSON object as `decision`, with value `commit` or `revert`.
+   - Include the active research mode in that JSON object as `research_mode`.
 5. Append a short matching note to the kernel-specific `optimization_log.md`.
+   - State the active research mode and whether external sources were consulted.
 6. Compare the new entry against that baseline.
 7. Recommend `revert` or `commit`.
 
@@ -38,7 +42,7 @@ Run the quick Modal benchmark for the target kernel, append the result to the co
 - Recommend `revert` if correctness regressed.
 - Recommend `revert` if performance did not improve over baseline.
 - Recommend `commit` only if correctness is preserved and performance improved.
-- The appended benchmark-history entry should use that same final recommendation as its `decision` field.
+- The appended benchmark-history entry should use that same final recommendation as its `decision` field and should include the provided `research_mode`.
 - If the workflow later reverts the experiment, revert only the current iteration's optimization edits and do not disturb unrelated local changes.
 
 ## Output
@@ -47,5 +51,5 @@ Run the quick Modal benchmark for the target kernel, append the result to the co
 - Baseline entry used for comparison
 - Delta vs baseline
 - Final recommendation: `revert` or `commit`
-- Exact JSONL entry appended, including `decision`
+- Exact JSONL entry appended, including `decision` and `research_mode`
 - Exact optimization-log note appended

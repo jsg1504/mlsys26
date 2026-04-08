@@ -33,7 +33,8 @@ Use this skill for the two project kernels:
    - `conda run -n fi-bench modal run scripts/run_modal_subfolder.py --subfolder <subfolder>`
 9. Append the benchmark result to the correct kernel log.
    - Include the final workflow decision in the JSONL entry as `decision: "commit"` or `decision: "revert"` for optimization iterations.
-10. Append a short note to the matching optimization log summarizing the experiment, result, and decision.
+   - Include the active research mode in the JSONL entry as `research_mode: "local_only" | "auto" | "required"`.
+10. Append a short note to the matching optimization log summarizing the experiment, result, decision, research mode, and whether external sources were consulted.
 11. Compare against the latest comparable quick benchmark baseline.
 12. Revert only the current iteration's optimization edits if correctness regressed or performance did not improve.
 13. Commit only if correctness is preserved and performance improved.
@@ -68,7 +69,8 @@ Use this skill for the two project kernels:
 - Research recommendations should cite the current profile findings that motivated the idea.
 - Research recommendations should state which benchmark entry is being used as the comparable baseline.
 - Research recommendations should state which `external_research` mode was used and why external sources were or were not consulted.
-- Optimization-iteration entries appended to `bench_history.jsonl` should include a `decision` field with `commit` or `revert`.
+- Optimization-iteration entries appended to `bench_history.jsonl` should include both `decision` and `research_mode`.
+- Matching entries appended to `optimization_log.md` should state the active research mode and whether external sources were consulted.
 - Reverts in this workflow should back out only the current iteration's experiment and must not disturb unrelated local changes.
 
 ## Delegation
@@ -102,5 +104,6 @@ Each runbook includes:
 - Review findings or explicit review pass
 - New quick benchmark entry in the kernel-specific log
 - Short optimization-log note in the kernel-specific markdown log
-- Benchmark-history entry should include the final `decision`
+- Benchmark-history entry should include the final `decision` and the active `research_mode`
+- Optimization-log note should mention the active `research_mode` and whether external sources were consulted
 - Decision: `revert` or `commit`

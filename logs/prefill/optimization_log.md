@@ -5,6 +5,7 @@ Tracking all optimization iterations for the prefill kernel.
 ---
 
 <!-- Append new entries below this line -->
+<!-- New entries should note the active research mode and whether external sources were consulted. -->
 
 ## 2026-04-07 Iteration 1
 

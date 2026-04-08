@@ -23,7 +23,8 @@ Use this skill for the two project kernels:
    - For prefill, treat the checked-in profiling harness as directional rather than authoritative when it diverges from the current wrapper dispatch or the latest logged quick-benchmark evidence.
 4. Research the next optimization candidate.
    - During research, read relevant documents under `docs/` first when they apply to the target kernel or optimization topic.
-   - Then actively consult relevant official documentation and papers when they can sharpen the bottleneck analysis or proposed optimization.
+   - Set `external_research` to one of `local_only`, `auto`, or `required` before ranking ideas. Default to `auto` when no mode is specified.
+   - Use external official documentation or papers only as allowed by the active `external_research` mode.
    - Ground the recommendation in the latest profile findings, but resolve prefill conflicts using the current kernel plus the latest benchmark and optimization logs.
 5. Choose exactly one idea for the iteration.
 6. Implement only that one idea.
@@ -37,6 +38,20 @@ Use this skill for the two project kernels:
 12. Revert only the current iteration's optimization edits if correctness regressed or performance did not improve.
 13. Commit only if correctness is preserved and performance improved.
 
+## Research Policy
+
+- Always read relevant `docs/` materials before deciding whether external research is needed.
+- `external_research: local_only`
+  - Use only the current kernel, profile, benchmark log, optimization log, and relevant `docs/` materials.
+  - Do not use external web sources.
+- `external_research: auto`
+  - Use local project materials first.
+  - Use external official documentation or papers only when the local kernel, profile, logs, and `docs/` do not provide enough evidence to justify the recommendation cleanly.
+  - If external sources are used, state what local evidence was insufficient.
+- `external_research: required`
+  - Use local project materials first.
+  - Then actively consult relevant official documentation and papers when they can improve bottleneck analysis, validate an optimization idea, or sharpen the implementation plan.
+
 ## Hard Rules
 
 - One optimization idea per iteration.
@@ -49,9 +64,10 @@ Use this skill for the two project kernels:
 - For prefill, `scripts/profile_kernel.py` is still required, but its results are only directional if they disagree with the current dispatch behavior or the latest benchmark history.
 - Correctness regression always loses to speed.
 - Research subagents should consult relevant `docs/` materials before proposing new optimization ideas.
-- Research subagents should actively use relevant official documentation and papers, not just local notes, when evaluating optimization ideas.
+- Research subagents must obey the active `external_research` mode when deciding whether to use external official documentation and papers.
 - Research recommendations should cite the current profile findings that motivated the idea.
 - Research recommendations should state which benchmark entry is being used as the comparable baseline.
+- Research recommendations should state which `external_research` mode was used and why external sources were or were not consulted.
 - Optimization-iteration entries appended to `bench_history.jsonl` should include a `decision` field with `commit` or `revert`.
 - Reverts in this workflow should back out only the current iteration's experiment and must not disturb unrelated local changes.
 

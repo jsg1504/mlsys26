@@ -16,14 +16,15 @@
 
 ```text
 Read `gdn_decode_qk4_v8_d128_k_last/solution/cuda/kernel.cu`, `logs/decode/bench_history.jsonl`, and `logs/decode/optimization_log.md`.
+External research mode: `auto` by default. Override with `local_only` to forbid external web research or `required` to mandate it.
 Before ranking ideas, run:
 `conda run -n fi-bench modal run scripts/profile_kernel.py --kernel decode`
 Also read any relevant materials under `docs/` before ranking ideas.
-Actively consult relevant official documentation and papers if they help validate bottlenecks or improve the proposed optimization.
+Only consult external official documentation and papers if the active external research mode allows it.
 Treat the latest comparable committed quick benchmark entry as baseline when one exists. If decode has no optimization-iteration commit yet, use the latest quick benchmark entry and call out that bootstrap assumption explicitly.
 Use the current profile results to identify the dominant bottlenecks and cite the relevant profile findings.
 Identify the most likely current bottleneck in the decode kernel and rank 2-3 next optimization ideas for a single iteration.
-Return the top recommendation, expected impact, implementation sketch, any correctness constraints, which benchmark entry is the baseline, which `docs/` files informed the recommendation, and which official documents or papers materially influenced it.
+Return the top recommendation, expected impact, implementation sketch, any correctness constraints, which benchmark entry is the baseline, which external research mode was used, which `docs/` files informed the recommendation, whether external sources were consulted and why, and which official documents or papers materially influenced it if any were used.
 ```
 
 ## Worker Message: Implement

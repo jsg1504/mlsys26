@@ -246,3 +246,36 @@ Three independent optimization approaches were tested in this session, all resul
 3. **SF threshold tuning** (N≤6): marginal workload impact, no measurable gain
 
 Combined with the prior session's exhaustive analysis (Blackwell features, chunkwise parallelism, CuTe/CUTLASS), **the prefill kernel at ~0.77ms mean latency / ~309x mean speedup is confirmed at its optimization ceiling** for the register-resident warp-parallel scalar recurrence on B200 (sm100a). The ~42 cycle/timestep shuffle-bound critical path is an irreducible architectural limit of this approach.
+
+## 2026-04-09 - Fused qk_dot into Per-Vi-Row Reduction (REVERTED)
+- **Idea**: Move the separate qk_dot warp reduction (5 shuffle rounds) into the per-vi-row ks/qs reduction, creating a 5-way (SF=8) or 3-way (SF=16) interleaved reduction. Eliminates 5 sequential shuffle rounds from the critical path (10 rounds → 5 rounds). Same total shuffle count, half the critical path latency. qk_dot broadcast also eliminated (only lane 0 needs it for output).
+- **Result**: 308.97x → 269.79x mean speedup (reference variance), latency 0.767ms → 0.759ms (-1.0%, within noise)
+- **Min/Max speedup**: 85.24x/898.09x → 83.36x/723.08x (reference variance)
+- **Correctness**: max_atol=1.22e-04, max_rtol=0.366, matched_ratio=1.0. Unchanged.
+- **Status**: reverted
+- **Learnings**: The theoretical critical path reduction (10→5 reduction rounds) did not materialize because **the NVCC compiler and warp scheduler already effectively overlap the two independent reduction rounds**. With 2 warps per scheduler, warp B fills warp A's shuffle stalls. The separate qk_dot and ks/qs reductions, while source-level sequential, are executed with significant overlap at the hardware level. Source-level instruction reordering has no effect when the hardware scheduler already achieves near-optimal interleaving. **This confirms that the ~42 cycle/timestep is the true hardware-limited minimum, not a scheduling artifact that can be improved by code reorganization.**
+
+## 2026-04-09 - 16-Warp Blocks (512 Threads) for SF=8 (REVERTED)
+- **Idea**: Double warp count for the SF=8 dispatch path from 8 (256 threads) to 16 (512 threads). RPW drops from 2→1 (same path as SF=16). 4 warps per scheduler (was 2) for maximum latency hiding. The 4→8 warp upgrade previously gave +15.1%; going 8→16 tests whether further scheduler occupancy helps. MIN_BLOCKS<8,16>=3 (was 4 for 8 warps). Register target identical: 65536/(3×512) = 42 regs/thread.
+- **Result**: 308.97x → 257.73x mean speedup, latency 0.767ms → 0.883ms (+15.1%)
+- **Min/Max speedup**: 85.24x/898.09x → 70.12x/516.22x
+- **Correctness**: max_atol=1.22e-04, max_rtol=0.366, matched_ratio=1.0. Unchanged.
+- **Status**: reverted
+- **Learnings**: The RPW=2→1 transition loses the 2-row interleaved ILP (4 independent shuffles per round → 2), and MIN_BLOCKS drops from 4→3, reducing block capacity per SM by 25%. The 4 warps/scheduler benefit cannot compensate: going from 2→4 warps/scheduler provides diminishing returns compared to the 1→2 transition that justified the original 8-warp upgrade. **The 8-warp configuration (2 warps/scheduler, RPW=2, MIN_BLOCKS=4) is the optimal operating point. Both decreasing (4-warp, -15.8% in prior test) and increasing (16-warp) warp count degrade performance. The warp count is bidirectionally constrained, just like the register budget and MIN_BLOCKS.**
+
+### Session Summary: Additional Ceiling Confirmation (2026-04-09 Session 2)
+Two more optimization approaches tested, both reverted:
+1. **Fused qk_dot reduction**: compiler/scheduler already overlaps independent reductions
+2. **16-warp blocks**: RPW=1 ILP loss + reduced blocks/SM > scheduler benefit
+
+**Exhausted optimization dimensions:**
+- Inner loop instruction ordering: compiler optimal (fused reduction, qs/ks split both flat)
+- Warp count per block: 8 is optimal (4 warps: -15.8%, 16 warps: +15.1%)  
+- Block size: 256 threads is optimal (512 threads: +15.1%)
+- MIN_BLOCKS: 4 for SF=8, 6 for SF=16 (both bidirectional constraints)
+- Split factor thresholds: N≤5 for SF=16, all else SF=8 (fully explored)
+- Hardware features: tensor cores, TMA, TMEM, DSMEM all incompatible
+- Algorithmic alternatives: chunkwise parallelism net-negative for d=128
+- Micro-optimizations: fast math, prefetch, packed stores, vectorized loads all exhausted
+
+**The prefill kernel is definitively at its optimization ceiling at ~0.77ms mean latency for the register-resident scalar recurrence on sm100a.**

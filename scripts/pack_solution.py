@@ -18,7 +18,9 @@ except ImportError:
     import tomli as tomllib
 
 from flashinfer_bench import BuildSpec
-from flashinfer_bench.agents import pack_solution_from_files
+from flashinfer_bench.data import Solution, SourceFile
+
+VALID_SOURCE_EXTENSIONS = {".py", ".cu", ".cuh", ".cpp", ".c", ".h", ".hpp"}
 
 
 def load_config() -> dict:
@@ -46,6 +48,8 @@ def pack_solution(output_path: Path = None) -> Path:
         source_dir = PROJECT_ROOT / "solution" / "triton"
     elif language == "cuda":
         source_dir = PROJECT_ROOT / "solution" / "cuda"
+    elif language == "python":
+        source_dir = PROJECT_ROOT / "solution" / "python"
     else:
         raise ValueError(f"Unsupported language: {language}")
 
@@ -59,15 +63,30 @@ def pack_solution(output_path: Path = None) -> Path:
         target_hardware=["cuda"],
         entry_point=entry_point,
         destination_passing_style=dps,
+        dependencies=build_config.get("dependencies", []),
+        binding=build_config.get("binding"),
     )
 
-    # Pack the solution
-    solution = pack_solution_from_files(
-        path=str(source_dir),
-        spec=spec,
+    # Pack the solution recursively while preserving relative paths.
+    sources = []
+    for file_path in sorted(source_dir.rglob("*")):
+        if not file_path.is_file():
+            continue
+        if file_path.suffix.lower() not in VALID_SOURCE_EXTENSIONS:
+            continue
+        rel_path = file_path.relative_to(source_dir).as_posix()
+        sources.append(SourceFile(path=rel_path, content=file_path.read_text()))
+
+    if not sources:
+        raise ValueError(f"No source files found in directory: {source_dir}")
+
+    solution = Solution(
         name=solution_config["name"],
         definition=solution_config["definition"],
         author=solution_config["author"],
+        description=solution_config.get("description", ""),
+        spec=spec,
+        sources=sources,
     )
 
     # Write to output file

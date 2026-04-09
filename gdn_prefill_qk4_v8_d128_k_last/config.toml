@@ -1,9 +1,12 @@
 [solution]
-name = "gdn-prefill-v1"
+name = "gdn-prefill-bw-chunked-cu-bridge"
 definition = "gdn_prefill_qk4_v8_d128_k_last"
 author = "KimJangMaengShin"
+description = "kernel.cu torch-extension bridge to the Blackwell chunked GDN prefill implementation"
 
 [build]
 language = "cuda"
-entry_point = "kernel.cu::kernel"
-destination_passing_style = true
+entry_point = "kernel.cu::run"
+destination_passing_style = false
+binding = "torch"
+dependencies = ["cuda-python", "nvidia-cutlass-dsl"]

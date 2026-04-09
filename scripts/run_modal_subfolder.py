@@ -21,15 +21,27 @@ TRACE_SET_PATH = "/data"
 
 image = (
     modal.Image.from_registry(
-        "nvidia/cuda:12.8.1-devel-ubuntu22.04",
+        "nvidia/cuda:13.2.0-devel-ubuntu22.04",
         add_python="3.12",
     )
-    .pip_install("flashinfer-bench", "torch", "triton", "numpy")
+    .pip_install(
+        "flashinfer-bench",
+        "torch",
+        "triton",
+        "numpy",
+        "cuda-python",
+        "nvidia-cutlass-dsl",
+    )
 )
 
 
 @app.function(image=image, gpu="B200:1", timeout=3600, volumes={TRACE_SET_PATH: trace_volume})
-def run_benchmark(solution: Solution, config: BenchmarkConfig = None) -> dict:
+def run_benchmark(
+    solution: Solution,
+    config: BenchmarkConfig = None,
+    max_workloads: int = 0,
+    workload_offset: int = 0,
+) -> dict:
     """Run benchmark on Modal B200 and return results."""
     if config is None:
         config = BenchmarkConfig(warmup_runs=3, iterations=100, num_trials=5)
@@ -41,6 +53,10 @@ def run_benchmark(solution: Solution, config: BenchmarkConfig = None) -> dict:
 
     definition = trace_set.definitions[solution.definition]
     workloads = trace_set.workloads.get(solution.definition, [])
+    if workload_offset > 0:
+        workloads = workloads[workload_offset:]
+    if max_workloads > 0:
+        workloads = workloads[:max_workloads]
 
     if not workloads:
         raise ValueError(f"No workloads found for definition '{solution.definition}'")
@@ -65,6 +81,8 @@ def run_benchmark(solution: Solution, config: BenchmarkConfig = None) -> dict:
                 "status": trace.evaluation.status.value,
                 "solution": trace.solution,
             }
+            if trace.evaluation.log:
+                entry["log"] = trace.evaluation.log
             if trace.evaluation.performance:
                 entry["latency_ms"] = trace.evaluation.performance.latency_ms
                 entry["reference_latency_ms"] = trace.evaluation.performance.reference_latency_ms
@@ -97,15 +115,28 @@ def print_results(results: dict):
                 print(f" | abs_err={abs_err:.2e}, rel_err={rel_err:.2e}", end="")
 
             print()
+            if status != "PASSED" and result.get("log"):
+                print("    log:")
+                for line in result["log"].strip().splitlines():
+                    print(f"      {line}")
 
 
 @app.local_entrypoint()
-def main(subfolder: str, quick: bool = True):
+def main(
+    subfolder: str,
+    quick: bool = True,
+    max_workloads: int = 0,
+    workload_offset: int = 0,
+    isolated_runner: bool = False,
+):
     """Load pre-packed solution.json from subfolder and run benchmark on Modal.
 
     Args:
         subfolder: Which subfolder to benchmark (e.g. gdn_decode_qk4_v8_d128_k_last)
         quick: Use fast config for development (default). Pass --no-quick for final submission.
+        max_workloads: Limit benchmark to the next N workloads for faster compile/runtime checks.
+        workload_offset: Skip the first N workloads before benchmarking.
+        isolated_runner: Use isolated subprocess workers instead of the persistent runner.
     """
     import scripts.pack_solution as ps
     ps.PROJECT_ROOT = PROJECT_ROOT / subfolder
@@ -116,13 +147,30 @@ def main(subfolder: str, quick: bool = True):
     print(f"Loaded: {solution.name} ({solution.definition})")
 
     if quick:
-        config = BenchmarkConfig(warmup_runs=1, iterations=3, num_trials=1)
+        config = BenchmarkConfig(
+            warmup_runs=1,
+            iterations=3,
+            num_trials=1,
+            use_isolated_runner=isolated_runner,
+        )
         print("\nRunning benchmark on Modal B200 (quick mode)...")
     else:
-        config = BenchmarkConfig(warmup_runs=3, iterations=100, num_trials=5)
+        config = BenchmarkConfig(
+            warmup_runs=3,
+            iterations=100,
+            num_trials=5,
+            use_isolated_runner=isolated_runner,
+        )
         print("\nRunning benchmark on Modal B200 (full mode)...")
 
-    results = run_benchmark.remote(solution, config)
+    if workload_offset > 0:
+        print(f"Skipping first {workload_offset} workloads...")
+    if max_workloads > 0:
+        print(f"Limiting benchmark to next {max_workloads} workloads...")
+    if isolated_runner:
+        print("Using isolated runner...")
+
+    results = run_benchmark.remote(solution, config, max_workloads, workload_offset)
 
     if not results:
         print("No results returned!")

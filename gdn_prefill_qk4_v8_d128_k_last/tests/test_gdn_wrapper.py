@@ -31,6 +31,7 @@ def fake_get_compiled(problem_size, dtype, scale):
     runtime_calls["cache_keys"].append(key)
     runtime_calls["scales"].append(scale)
     if key not in compiled_cache:
+
         def fake_compiled(*args, **kwargs):
             runtime_calls["launches"] += 1
 
@@ -38,13 +39,7 @@ def fake_get_compiled(problem_size, dtype, scale):
     return compiled_cache[key]
 
 
-gdn.GDN.can_implement = staticmethod(lambda *args, **kwargs: True)
-gdn._get_compiled_gdn_prefill_kernel = fake_get_compiled
-gdn.cuda.CUstream = lambda stream: stream
-gdn.torch.cuda.current_stream = lambda: SimpleNamespace(cuda_stream=0)
-
 pc._CU_SEQLENS_METADATA_CACHE.clear()
-
 q, k, v, gate, beta, state, cu_seqlens = make_inputs()
 original_tolist = torch.Tensor.tolist
 tolist_calls = 0
@@ -56,7 +51,12 @@ def counting_tolist(self, *args, **kwargs):
     return original_tolist(self, *args, **kwargs)
 
 
-with mock.patch.object(torch.Tensor, "tolist", counting_tolist):
+with (
+    mock.patch.object(gdn, "_get_compiled_gdn_prefill_kernel", side_effect=fake_get_compiled),
+    mock.patch.object(gdn.cuda, "CUstream", side_effect=lambda stream: stream),
+    mock.patch.object(gdn.torch.cuda, "current_stream", return_value=SimpleNamespace(cuda_stream=0)),
+    mock.patch.object(torch.Tensor, "tolist", counting_tolist),
+):
     output, output_state = gdn.chunk_gated_delta_rule(
         q=q,
         k=k,
@@ -89,7 +89,9 @@ with mock.patch.object(torch.Tensor, "tolist", counting_tolist):
     )
 
 assert output.shape == v.shape
+assert output.dtype == torch.bfloat16
 assert output_state.shape == state.shape
+assert output_state.dtype == torch.float32
 assert second_output.shape == v.shape
 assert second_output_state.shape == state.shape
 assert default_scale_output.shape == v.shape

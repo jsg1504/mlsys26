@@ -18,20 +18,16 @@ limitations under the License.
 #
 # Implements the Chunk-wise Gated Delta Rule linear attention using CuTe-DSL,
 # for Blackwell Architecture.
-# This file is vendored from the released baseline runtime. Task 4 local edits are
-# intentionally confined to the submission wrapper and its small metadata helpers
+# This file is vendored from the released baseline runtime. Task 5 local edits are
+# intentionally confined to the specialized submission seam and its small metadata helpers
 # near the bottom of the file.
 #
-# Key Features:
-#   - Supports Persistent & Non-persistent modes
-#   - Supports fixed-length and variable-length sequences (cu_seqlens)
-#   - Supports grouped value attention (GVA) where h_v is a multiple of h_q
-#   - Supports head dimension (128)
-#   - Supports input data types (f16/bf16)
-#   - Supports output data types (f16/bf16)
-#   - Supports initial_state to provide the initial state
-#   - Supports output_final_state flag to return the final state
-#   - State input and output are in f32 (fp16/bf16 not supported yet)
+# Task 5 submission contract:
+#   - varlen prefill only
+#   - non-persistent scheduling only
+#   - q/k heads == 4, v heads == 8, head dim == 128
+#   - bf16 q/k/v inputs and outputs
+#   - fp32 g/beta inputs and fp32 state input/output
 
 import torch
 
@@ -65,7 +61,7 @@ def make_thread_cooperative_group(size: Int32):
 
 
 class GDN:
-    """Blackwell (SM100) kernel for Chunk-wise Gated Delta Rule linear attention."""
+    """Blackwell (SM100) kernel specialized to the Task 5 contest definition."""
 
     def __init__(
         self,
@@ -75,6 +71,10 @@ class GDN:
     ):
         if is_persistent:
             raise ValueError("Task 5 runtime only supports non-persistent mode.")
+        if chunk_size != 128:
+            raise ValueError("Task 5 runtime only supports chunk_size == 128.")
+        if head_dim != 128:
+            raise ValueError("Task 5 runtime only supports head_dim == 128.")
         self.chunk_size = chunk_size
         self.is_persistent = False
 
@@ -4626,7 +4626,7 @@ def chunk_gated_delta_rule(
     cu_seqlens: Optional[torch.Tensor] = None,
     scale: Optional[float] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Compile (on first call) and run the Task 4 shell-only GDN wrapper.
+    """Compile (on first call) and run the Task 5 shell-only GDN wrapper.
 
     Args:
         q, k: (1, T, H_qk, D) query and key tensors from the current shell.
@@ -4638,12 +4638,12 @@ def chunk_gated_delta_rule(
         scale: Scale factor for the attention scores. Defaults to 1/sqrt(D).
 
     Returns:
-        Tuple of `(output, output_state)` for the current shell only.
+        Tuple of `(output, output_state)` for the Task 5 runtime seam only.
     """
     if initial_state is None:
-        raise ValueError("Task 4 wrapper requires initial_state.")
+        raise ValueError("Task 5 wrapper requires initial_state.")
     if cu_seqlens is None:
-        raise ValueError("Task 4 wrapper requires cu_seqlens.")
+        raise ValueError("Task 5 wrapper requires cu_seqlens.")
     metadata = _validate_task4_wrapper_inputs(q, k, v, g, beta, initial_state, cu_seqlens)
     normalized_scale = q.shape[-1] ** -0.5 if scale is None else scale
 

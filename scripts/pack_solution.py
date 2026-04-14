@@ -18,6 +18,7 @@ except ImportError:
     import tomli as tomllib
 
 from flashinfer_bench import BuildSpec
+from flashinfer_bench import Solution, SourceFile
 from flashinfer_bench.agents import pack_solution_from_files
 
 
@@ -40,6 +41,48 @@ def _build_spec_from_config(build_config: dict) -> BuildSpec:
         entry_point=build_config["entry_point"],
         dependencies=build_config.get("dependencies", []),
         destination_passing_style=build_config.get("destination_passing_style", True),
+    )
+
+
+def _pack_python_solution_from_files(
+    path: str, spec: BuildSpec, name: str, definition: str, author: str, description: str = ""
+) -> Solution:
+    """Pack a Python solution directory recursively, preserving relative paths."""
+    path_obj = Path(path)
+
+    if not path_obj.exists():
+        raise ValueError(f"Path does not exist: {path}")
+
+    if not path_obj.is_dir():
+        raise ValueError(f"Path is not a directory: {path}")
+
+    sources = []
+
+    for file_path in sorted(path_obj.rglob("*")):
+        if not file_path.is_file():
+            continue
+
+        ext = file_path.suffix.lower()
+        if ext not in {".py", ".cu", ".cuh", ".cpp", ".c", ".h", ".hpp"}:
+            continue
+
+        with open(file_path, "r", encoding="utf-8") as f:
+            content = f.read()
+
+        sources.append(
+            SourceFile(path=file_path.relative_to(path_obj).as_posix(), content=content)
+        )
+
+    if not sources:
+        raise ValueError(f"No source files found in directory: {path}")
+
+    return Solution(
+        name=name,
+        definition=definition,
+        author=author,
+        description=description,
+        spec=spec,
+        sources=sources,
     )
 
 
@@ -70,13 +113,22 @@ def pack_solution(output_path: Path = None) -> Path:
     spec = _build_spec_from_config(build_config)
 
     # Pack the solution
-    solution = pack_solution_from_files(
-        path=str(source_dir),
-        spec=spec,
-        name=solution_config["name"],
-        definition=solution_config["definition"],
-        author=solution_config["author"],
-    )
+    if language == "python":
+        solution = _pack_python_solution_from_files(
+            path=str(source_dir),
+            spec=spec,
+            name=solution_config["name"],
+            definition=solution_config["definition"],
+            author=solution_config["author"],
+        )
+    else:
+        solution = pack_solution_from_files(
+            path=str(source_dir),
+            spec=spec,
+            name=solution_config["name"],
+            definition=solution_config["definition"],
+            author=solution_config["author"],
+        )
 
     # Write to output file
     if output_path is None:

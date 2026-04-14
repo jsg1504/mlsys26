@@ -1,4 +1,5 @@
 from pathlib import Path
+import tempfile
 import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -26,3 +27,25 @@ assert spec.language == "python"
 assert spec.entry_point == "main.py::run"
 assert spec.dependencies == ["cutlass", "cuda-python"]
 assert spec.destination_passing_style is False
+
+with tempfile.TemporaryDirectory() as tmpdir:
+    tmp_path = Path(tmpdir)
+    (tmp_path / "main.py").write_text("def run():\n    pass\n")
+    nested = tmp_path / "gdn_blackwell"
+    nested.mkdir()
+    (nested / "__init__.py").write_text("from .gdn import chunk_gated_delta_rule\n")
+    (nested / "gdn.py").write_text("value = 1\n")
+
+    packed = ps._pack_python_solution_from_files(
+        path=str(tmp_path),
+        spec=spec,
+        name="demo",
+        definition="demo-def",
+        author="demo-author",
+    )
+
+    assert [source.path for source in packed.sources] == [
+        "gdn_blackwell/__init__.py",
+        "gdn_blackwell/gdn.py",
+        "main.py",
+    ]

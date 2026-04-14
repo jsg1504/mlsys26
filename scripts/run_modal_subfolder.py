@@ -22,6 +22,7 @@ trace_volume = modal.Volume.from_name("flashinfer-trace", create_if_missing=True
 TRACE_SET_PATH = "/data"
 DEFAULT_BENCHMARK_TIMEOUT_SECONDS = 300
 QUICK_BENCHMARK_TIMEOUT_SECONDS = 120
+QUICK_WORKLOAD_LIMIT = 3
 
 image = (
     modal.Image.from_registry(
@@ -40,10 +41,18 @@ image = (
 
 
 @app.function(image=image, gpu="B200:1", timeout=3600, volumes={TRACE_SET_PATH: trace_volume})
-def run_benchmark(solution: Solution, config: BenchmarkConfig = None) -> dict:
+def run_benchmark(solution: Solution, config: BenchmarkConfig = None, workload_limit: int | None = None) -> dict:
     """Run benchmark on Modal B200 and return results."""
     if config is None:
         config = BenchmarkConfig(warmup_runs=3, iterations=100, num_trials=5)
+
+    if workload_limit is None and (
+        config.warmup_runs == 1
+        and config.iterations == 3
+        and config.num_trials == 1
+        and config.timeout_seconds == QUICK_BENCHMARK_TIMEOUT_SECONDS
+    ):
+        workload_limit = QUICK_WORKLOAD_LIMIT
 
     configure_logging(level=logging.INFO)
 
@@ -57,6 +66,9 @@ def run_benchmark(solution: Solution, config: BenchmarkConfig = None) -> dict:
 
     if not workloads:
         raise ValueError(f"No workloads found for definition '{solution.definition}'")
+
+    if workload_limit is not None:
+        workloads = workloads[:workload_limit]
 
     bench_trace_set = TraceSet(
         root=trace_set.root,
@@ -164,11 +176,13 @@ def main(subfolder: str, quick: bool = True):
 
     config = build_benchmark_config(quick)
     mode = "quick" if quick else "full"
+    workload_limit = QUICK_WORKLOAD_LIMIT if quick else None
+    workload_note = f", {workload_limit} workloads max" if workload_limit is not None else ""
     print_phase(
-        f"Submitting benchmark to Modal B200 ({mode} mode, timeout {config.timeout_seconds}s)..."
+        f"Submitting benchmark to Modal B200 ({mode} mode, timeout {config.timeout_seconds}s{workload_note})..."
     )
 
-    results = run_benchmark.remote(solution, config)
+    results = run_benchmark.remote(solution, config, workload_limit)
     print_phase("Remote benchmark complete.")
 
     if not results:

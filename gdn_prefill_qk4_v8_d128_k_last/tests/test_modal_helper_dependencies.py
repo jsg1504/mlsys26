@@ -75,6 +75,66 @@ def test_benchmark_config_helper_uses_shorter_quick_timeout(monkeypatch):
     assert full_config.timeout_seconds == 300
 
 
+def test_quick_mode_limits_workloads_and_full_mode_keeps_all(monkeypatch):
+    module = load_runner_module(monkeypatch)
+
+    quick_trace_workloads = [types.SimpleNamespace(uuid=f"quick-{idx:02d}") for idx in range(6)]
+    full_trace_workloads = [types.SimpleNamespace(uuid=f"full-{idx:02d}") for idx in range(6)]
+
+    captured_workloads = []
+
+    class FakeBenchmark:
+        def __init__(self, trace_set, config):
+            captured_workloads.append(list(trace_set.workloads["demo_def"]))
+            self.trace_set = trace_set
+            self.config = config
+
+        def run_all(self, dump_traces=True):
+            return types.SimpleNamespace(traces={"demo_def": []})
+
+    class FakeTraceSet:
+        def __init__(self, root=None, definitions=None, solutions=None, workloads=None, traces=None):
+            self.root = root
+            self.definitions = definitions or {}
+            self.solutions = solutions or {}
+            self.workloads = workloads or {}
+            self.traces = traces or {}
+
+        @classmethod
+        def from_path(cls, path):
+            return cls(
+                root=Path("/tmp"),
+                definitions={"demo_def": types.SimpleNamespace(name="demo_def")},
+                workloads={"demo_def": list(quick_trace_workloads)},
+            )
+
+    monkeypatch.setattr(module, "Benchmark", FakeBenchmark)
+    monkeypatch.setattr(module, "TraceSet", FakeTraceSet)
+
+    class FakeSolution:
+        definition = "demo_def"
+
+    module.run_benchmark(FakeSolution(), module.build_benchmark_config(True))
+
+    assert len(captured_workloads[-1]) == module.QUICK_WORKLOAD_LIMIT
+    assert [trace.uuid for trace in captured_workloads[-1]] == [
+        f"quick-{idx:02d}" for idx in range(module.QUICK_WORKLOAD_LIMIT)
+    ]
+
+    def full_from_path(cls, path):
+        return cls(
+            root=Path("/tmp"),
+            definitions={"demo_def": types.SimpleNamespace(name="demo_def")},
+            workloads={"demo_def": list(full_trace_workloads)},
+        )
+
+    monkeypatch.setattr(FakeTraceSet, "from_path", classmethod(full_from_path))
+
+    module.run_benchmark(FakeSolution(), module.build_benchmark_config(False))
+
+    assert len(captured_workloads[-1]) == len(full_trace_workloads)
+
+
 def test_main_emits_phase_progress_and_uses_quick_timeout(monkeypatch, tmp_path):
     module = load_runner_module(monkeypatch)
 
@@ -105,8 +165,8 @@ def test_main_emits_phase_progress_and_uses_quick_timeout(monkeypatch, tmp_path)
 
     remote_calls = []
 
-    def fake_remote(solution, config):
-        remote_calls.append((solution, config))
+    def fake_remote(solution, config, workload_limit):
+        remote_calls.append((solution, config, workload_limit))
         return {"demo_def": {}}
 
     monkeypatch.setattr(module.run_benchmark, "remote", fake_remote)
@@ -118,11 +178,12 @@ def test_main_emits_phase_progress_and_uses_quick_timeout(monkeypatch, tmp_path)
     text = output.getvalue()
     assert "[modal] Packing solution from source files..." in text
     assert "[modal] Loading packed solution..." in text
-    assert "[modal] Submitting benchmark to Modal B200 (quick mode, timeout 120s)..." in text
+    assert "[modal] Submitting benchmark to Modal B200 (quick mode, timeout 120s, 3 workloads max)..." in text
     assert "[modal] Remote benchmark complete." in text
     assert remote_calls[0][0].name == "demo"
     assert remote_calls[0][0].definition == "demo_def"
     assert remote_calls[0][1].timeout_seconds == 120
+    assert remote_calls[0][2] == 3
     assert captured_payload["text"] == solution_path.read_text(encoding="utf-8")
 
 

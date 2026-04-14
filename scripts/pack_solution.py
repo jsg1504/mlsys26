@@ -20,6 +20,7 @@ except ImportError:
 from flashinfer_bench import BuildSpec
 from flashinfer_bench import Solution, SourceFile
 from flashinfer_bench.agents import pack_solution_from_files
+from flashinfer_bench.agents.solution_handler import VALID_SOURCE_EXTENSIONS
 
 
 def _get_source_dir(language: str, project_root: Path) -> Path:
@@ -63,7 +64,7 @@ def _pack_python_solution_from_files(
             continue
 
         ext = file_path.suffix.lower()
-        if ext not in {".py", ".cu", ".cuh", ".cpp", ".cc", ".cxx", ".c", ".h", ".hpp"}:
+        if ext not in VALID_SOURCE_EXTENSIONS:
             continue
 
         with open(file_path, "r", encoding="utf-8") as f:

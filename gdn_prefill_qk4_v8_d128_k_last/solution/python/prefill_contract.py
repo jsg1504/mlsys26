@@ -51,6 +51,22 @@ def validate_inputs(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens):
         if not isinstance(tensor, torch.Tensor):
             raise TypeError(f"{name} must be a torch.Tensor, got {type(tensor).__name__}")
 
+    reference_device = q.device
+    for name, tensor in (
+        ("k", k),
+        ("v", v),
+        ("state", state),
+        ("A_log", A_log),
+        ("a", a),
+        ("dt_bias", dt_bias),
+        ("b", b),
+        ("cu_seqlens", cu_seqlens),
+    ):
+        if tensor.device != reference_device:
+            raise ValueError(
+                f"{name}.device must match q.device, got {tensor.device} and {reference_device}"
+            )
+
     if q.shape != k.shape:
         raise ValueError(f"q.shape and k.shape must match, got {tuple(q.shape)} and {tuple(k.shape)}")
     if v.shape[0] != q.shape[0]:

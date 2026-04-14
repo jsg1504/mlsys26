@@ -37,6 +37,14 @@ def run(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, scale):
         raise ValueError(
             f"chunk_gated_delta_rule output.shape must be {tuple(expected_output_shape)}, got {tuple(output.shape)}"
         )
+    if output.dtype != runtime_inputs["v"].dtype:
+        raise ValueError(
+            f"chunk_gated_delta_rule output.dtype must be {runtime_inputs['v'].dtype}, got {output.dtype}"
+        )
+    if output.device != runtime_inputs["v"].device:
+        raise ValueError(
+            f"chunk_gated_delta_rule output.device must be {runtime_inputs['v'].device}, got {output.device}"
+        )
     if not isinstance(new_state, torch.Tensor):
         raise TypeError(
             f"chunk_gated_delta_rule new_state must be a torch.Tensor, got {type(new_state).__name__}"
@@ -44,6 +52,14 @@ def run(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, scale):
     if new_state.shape != state.shape:
         raise ValueError(
             f"chunk_gated_delta_rule new_state.shape must be {tuple(state.shape)}, got {tuple(new_state.shape)}"
+        )
+    if new_state.dtype != state.dtype:
+        raise ValueError(
+            f"chunk_gated_delta_rule new_state.dtype must be {state.dtype}, got {new_state.dtype}"
+        )
+    if new_state.device != state.device:
+        raise ValueError(
+            f"chunk_gated_delta_rule new_state.device must be {state.device}, got {new_state.device}"
         )
 
     return output.squeeze(0), new_state

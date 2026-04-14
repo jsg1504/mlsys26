@@ -62,10 +62,28 @@ except ValueError as exc:
 else:
     raise AssertionError("Expected ValueError for pseudo-batched main.run inputs")
 
+try:
+    main.run(
+        q,
+        k,
+        v,
+        state,
+        A_log,
+        a,
+        dt_bias.to(device="meta"),
+        b,
+        cu_seqlens,
+        None,
+    )
+except ValueError as exc:
+    assert "device" in str(exc)
+else:
+    raise AssertionError("Expected ValueError for mismatched input devices")
+
 
 def fake_bad_chunk_gated_delta_rule(**kwargs):
-    bad_output = torch.empty((T, 8, 128), dtype=torch.bfloat16)
-    bad_state = torch.empty((1, 8, 128), dtype=torch.float32)
+    bad_output = torch.empty((1, T, 8, 128), dtype=torch.float32)
+    bad_state = torch.empty((1, 8, 128, 128), dtype=torch.float32)
     return bad_output, bad_state
 
 
@@ -74,6 +92,22 @@ main.chunk_gated_delta_rule = fake_bad_chunk_gated_delta_rule
 try:
     main.run(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, None)
 except ValueError as exc:
-    assert "output" in str(exc) or "new_state" in str(exc)
+    assert "output" in str(exc)
 else:
-    raise AssertionError("Expected ValueError for malformed chunk_gated_delta_rule return")
+    raise AssertionError("Expected ValueError for chunk_gated_delta_rule dtype mismatch")
+
+
+def fake_device_mismatch_chunk_gated_delta_rule(**kwargs):
+    bad_output = torch.empty((1, T, 8, 128), dtype=torch.bfloat16, device="meta")
+    bad_state = torch.empty((1, 8, 128, 128), dtype=torch.float32, device="meta")
+    return bad_output, bad_state
+
+
+main.chunk_gated_delta_rule = fake_device_mismatch_chunk_gated_delta_rule
+
+try:
+    main.run(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, None)
+except ValueError as exc:
+    assert "device" in str(exc)
+else:
+    raise AssertionError("Expected ValueError for chunk_gated_delta_rule device mismatch")

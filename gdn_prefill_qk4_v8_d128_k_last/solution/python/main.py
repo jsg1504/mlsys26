@@ -17,8 +17,9 @@ def _prepare_runtime_inputs(q, k, v, g, beta):
 
 
 def run(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, scale):
-    if q.ndim != 3 or k.ndim != 3 or v.ndim != 3:
-        raise ValueError("main.run currently accepts only flat varlen inputs for q, k, and v.")
+    if isinstance(q, torch.Tensor) and isinstance(k, torch.Tensor) and isinstance(v, torch.Tensor):
+        if q.ndim != 3 or k.ndim != 3 or v.ndim != 3:
+            raise ValueError("main.run currently accepts only flat varlen inputs for q, k, and v.")
     validate_inputs(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens)
     gate_log, beta = prepare_g_beta(A_log, a, dt_bias, b)
     runtime_inputs = _prepare_runtime_inputs(q, k, v, gate_log, beta)

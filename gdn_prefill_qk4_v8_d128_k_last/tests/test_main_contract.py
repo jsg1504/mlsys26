@@ -111,3 +111,22 @@ except ValueError as exc:
     assert "device" in str(exc)
 else:
     raise AssertionError("Expected ValueError for chunk_gated_delta_rule device mismatch")
+
+
+try:
+    main.run(
+        [],
+        k,
+        v,
+        state,
+        A_log,
+        a,
+        dt_bias,
+        b,
+        cu_seqlens,
+        None,
+    )
+except TypeError as exc:
+    assert "q must be a torch.Tensor" in str(exc)
+else:
+    raise AssertionError("Expected TypeError for non-tensor q input")

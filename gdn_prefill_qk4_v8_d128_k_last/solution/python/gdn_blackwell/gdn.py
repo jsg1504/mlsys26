@@ -18,6 +18,9 @@ limitations under the License.
 #
 # Implements the Chunk-wise Gated Delta Rule linear attention using CuTe-DSL,
 # for Blackwell Architecture.
+# This file is vendored from the released baseline runtime. Task 4 local edits are
+# intentionally confined to the submission wrapper and its small metadata helpers
+# near the bottom of the file.
 #
 # Key Features:
 #   - Supports Persistent & Non-persistent modes
@@ -4501,25 +4504,23 @@ class GDN:
 # ============================================================================
 
 
+_CU_SEQLENS_METADATA_CACHE = {}
+
+
 @functools.lru_cache(maxsize=128)
-def _get_problem_size(q_shape, v_shape, cu_seqlens_tuple):
-    """Compute problem_size, cached by (q_shape, v_shape, cu_seqlens tuple).
+def _get_problem_size(q_shape, v_shape, num_seqs, max_s_q, sum_s_q):
+    """Compute problem_size from validated Task 4 host metadata.
 
     Args:
         q_shape: Tuple of (b, s_q, h_q, d).
         v_shape: Tuple of (b, s_v, h_v, d).
-        cu_seqlens_tuple: Tuple of cumulative sequence lengths, or None.
+        num_seqs: Number of variable-length sequences in the flat batch.
+        max_s_q: Maximum per-sequence length.
+        sum_s_q: Sum of sequence lengths.
     """
-    b, s_q, h_q, d = q_shape
+    _, _, h_q, d = q_shape
     _, _, h_v, _ = v_shape
-    max_s_q = s_q
-    sum_s_q = s_q
-    if cu_seqlens_tuple is not None:
-        sum_s_q = cu_seqlens_tuple[-1]
-        b = len(cu_seqlens_tuple) - 1
-        max_s_q = max(cu_seqlens_tuple[i + 1] - cu_seqlens_tuple[i] for i in range(b))
-        return (b, max_s_q, sum_s_q, h_q, h_v, d)
-    return (b, max_s_q, sum_s_q, h_q, h_v, d)
+    return (num_seqs, max_s_q, sum_s_q, h_q, h_v, d)
 
 
 @functools.cache
@@ -4533,6 +4534,127 @@ def _get_compiled_gdn_prefill_kernel(
 ):
     """Cache compiled kernel for given configuration."""
     return {}
+
+
+def _get_cu_seqlens_metadata(cu_seqlens: torch.Tensor):
+    cache_key = (
+        cu_seqlens.device.type,
+        cu_seqlens.device.index,
+        cu_seqlens.data_ptr(),
+        cu_seqlens.numel(),
+        getattr(cu_seqlens, "_version", None),
+    )
+    cached = _CU_SEQLENS_METADATA_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    host_values = tuple(int(v) for v in cu_seqlens.detach().cpu().tolist())
+    num_seqs = len(host_values) - 1
+    max_s_q = max(
+        (host_values[i + 1] - host_values[i] for i in range(num_seqs)),
+        default=0,
+    )
+    metadata = {
+        "num_seqs": num_seqs,
+        "max_s_q": max_s_q,
+        "sum_s_q": host_values[-1] if host_values else 0,
+        "first": host_values[0] if host_values else None,
+        "last": host_values[-1] if host_values else None,
+        "nondecreasing": all(
+            host_values[i + 1] >= host_values[i] for i in range(len(host_values) - 1)
+        ),
+    }
+    _CU_SEQLENS_METADATA_CACHE[cache_key] = metadata
+    return metadata
+
+
+def _validate_task4_wrapper_inputs(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    initial_state: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+):
+    for name, tensor in (
+        ("q", q),
+        ("k", k),
+        ("v", v),
+        ("g", g),
+        ("beta", beta),
+        ("initial_state", initial_state),
+        ("cu_seqlens", cu_seqlens),
+    ):
+        if not isinstance(tensor, torch.Tensor):
+            raise TypeError(f"{name} must be a torch.Tensor, got {type(tensor).__name__}")
+
+    reference_device = q.device
+    for name, tensor in (
+        ("k", k),
+        ("v", v),
+        ("g", g),
+        ("beta", beta),
+        ("initial_state", initial_state),
+        ("cu_seqlens", cu_seqlens),
+    ):
+        if tensor.device != reference_device:
+            raise ValueError(f"{name}.device must match q.device, got {tensor.device} and {reference_device}")
+
+    if q.dtype != torch.bfloat16:
+        raise TypeError(f"q.dtype must be torch.bfloat16, got {q.dtype}")
+    if k.dtype != torch.bfloat16:
+        raise TypeError(f"k.dtype must be torch.bfloat16, got {k.dtype}")
+    if v.dtype != torch.bfloat16:
+        raise TypeError(f"v.dtype must be torch.bfloat16, got {v.dtype}")
+    if g.dtype != torch.float32:
+        raise TypeError(f"g.dtype must be torch.float32, got {g.dtype}")
+    if beta.dtype != torch.float32:
+        raise TypeError(f"beta.dtype must be torch.float32, got {beta.dtype}")
+    if initial_state.dtype != torch.float32:
+        raise TypeError(f"initial_state.dtype must be torch.float32, got {initial_state.dtype}")
+    if cu_seqlens.dtype != torch.int64:
+        raise TypeError(f"cu_seqlens.dtype must be torch.int64, got {cu_seqlens.dtype}")
+
+    if q.ndim != 4 or tuple(q.shape[0:1] + q.shape[2:4]) != (1, 4, 128):
+        raise ValueError(f"q.shape must be (1, T, 4, 128), got {tuple(q.shape)}")
+    if k.ndim != 4 or tuple(k.shape[0:1] + k.shape[2:4]) != (1, 4, 128):
+        raise ValueError(f"k.shape must be (1, T, 4, 128), got {tuple(k.shape)}")
+    if v.ndim != 4 or tuple(v.shape[0:1] + v.shape[2:4]) != (1, 8, 128):
+        raise ValueError(f"v.shape must be (1, T, 8, 128), got {tuple(v.shape)}")
+
+    T = q.shape[1]
+    if k.shape[1] != T:
+        raise ValueError(f"k.shape[1] must match q.shape[1], got {k.shape[1]} and {T}")
+    if v.shape[1] != T:
+        raise ValueError(f"v.shape[1] must match q.shape[1], got {v.shape[1]} and {T}")
+    if g.shape != (1, T, 8):
+        raise ValueError(f"g.shape must be (1, T, 8), got {tuple(g.shape)}")
+    if beta.shape != (1, T, 8):
+        raise ValueError(f"beta.shape must be (1, T, 8), got {tuple(beta.shape)}")
+    if initial_state.ndim != 4 or tuple(initial_state.shape[1:]) != (8, 128, 128):
+        raise ValueError(
+            f"initial_state.shape must be (N, 8, 128, 128), got {tuple(initial_state.shape)}"
+        )
+    if cu_seqlens.ndim != 1:
+        raise ValueError(f"cu_seqlens must be 1D, got {cu_seqlens.ndim}D")
+
+    metadata = _get_cu_seqlens_metadata(cu_seqlens)
+    if metadata["num_seqs"] < 1:
+        raise ValueError("cu_seqlens must describe at least one sequence.")
+    if metadata["first"] != 0:
+        raise ValueError(f"cu_seqlens must start at 0, got {metadata['first']}")
+    if metadata["last"] != T:
+        raise ValueError(f"cu_seqlens must end at T={T}, got {metadata['last']}")
+    if not metadata["nondecreasing"]:
+        raise ValueError("cu_seqlens must be nondecreasing.")
+    if initial_state.shape[0] != metadata["num_seqs"]:
+        raise ValueError(
+            "initial_state.shape[0] must match len(cu_seqlens) - 1, "
+            f"got {initial_state.shape[0]} and {metadata['num_seqs']}"
+        )
+
+    return metadata
 
 
 def chunk_gated_delta_rule(
@@ -4564,10 +4686,7 @@ def chunk_gated_delta_rule(
         raise ValueError("Task 4 wrapper requires initial_state.")
     if cu_seqlens is None:
         raise ValueError("Task 4 wrapper requires cu_seqlens.")
-    if q.ndim != 4 or k.ndim != 4 or v.ndim != 4:
-        raise ValueError("Task 4 wrapper supports only batch-size-1 flat-varlen tensors.")
-    if q.shape[0] != 1 or k.shape[0] != 1 or v.shape[0] != 1:
-        raise ValueError("Task 4 wrapper supports only batch size 1.")
+    metadata = _validate_task4_wrapper_inputs(q, k, v, g, beta, initial_state, cu_seqlens)
 
     # Allocate output if needed
     output = torch.empty_like(v)
@@ -4582,8 +4701,13 @@ def chunk_gated_delta_rule(
         False,
     ):
         raise ValueError("Unsupported input shape or dtype")
-    cu_seqlens_tuple = tuple(cu_seqlens.tolist()) if cu_seqlens is not None else None
-    problem_size = _get_problem_size(tuple(q.shape), tuple(v.shape), cu_seqlens_tuple)
+    problem_size = _get_problem_size(
+        tuple(q.shape),
+        tuple(v.shape),
+        metadata["num_seqs"],
+        metadata["max_s_q"],
+        metadata["sum_s_q"],
+    )
 
     # Allocate output_state if needed, current alloc both case.
     # TODO: Remove output_state when output_final_state is false.

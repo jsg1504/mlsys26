@@ -24,6 +24,8 @@ try:
         "prefill_contract.py",
         "gdn_blackwell/__init__.py",
         "gdn_blackwell/gdn.py",
+        "gdn_blackwell/gdn_helpers.py",
+        "gdn_blackwell/gdn_tile_scheduler.py",
     }
 finally:
     ps.PROJECT_ROOT = old_project_root

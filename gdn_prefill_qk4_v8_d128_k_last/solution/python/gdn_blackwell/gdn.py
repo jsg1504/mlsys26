@@ -48,6 +48,7 @@ from cutlass._mlir.dialects import nvvm
 
 import cuda.bindings.driver as cuda
 
+from prefill_contract import get_cu_seqlens_metadata
 
 from .gdn_tile_scheduler import *
 from .gdn_helpers import *
@@ -4504,9 +4505,6 @@ class GDN:
 # ============================================================================
 
 
-_CU_SEQLENS_METADATA_CACHE = {}
-
-
 @functools.lru_cache(maxsize=128)
 def _get_problem_size(q_shape, v_shape, num_seqs, max_s_q, sum_s_q):
     """Compute problem_size from validated Task 4 host metadata.
@@ -4534,38 +4532,6 @@ def _get_compiled_gdn_prefill_kernel(
 ):
     """Cache compiled kernel for given configuration."""
     return {}
-
-
-def _get_cu_seqlens_metadata(cu_seqlens: torch.Tensor):
-    cache_key = (
-        cu_seqlens.device.type,
-        cu_seqlens.device.index,
-        cu_seqlens.data_ptr(),
-        cu_seqlens.numel(),
-        getattr(cu_seqlens, "_version", None),
-    )
-    cached = _CU_SEQLENS_METADATA_CACHE.get(cache_key)
-    if cached is not None:
-        return cached
-
-    host_values = tuple(int(v) for v in cu_seqlens.detach().cpu().tolist())
-    num_seqs = len(host_values) - 1
-    max_s_q = max(
-        (host_values[i + 1] - host_values[i] for i in range(num_seqs)),
-        default=0,
-    )
-    metadata = {
-        "num_seqs": num_seqs,
-        "max_s_q": max_s_q,
-        "sum_s_q": host_values[-1] if host_values else 0,
-        "first": host_values[0] if host_values else None,
-        "last": host_values[-1] if host_values else None,
-        "nondecreasing": all(
-            host_values[i + 1] >= host_values[i] for i in range(len(host_values) - 1)
-        ),
-    }
-    _CU_SEQLENS_METADATA_CACHE[cache_key] = metadata
-    return metadata
 
 
 def _validate_task4_wrapper_inputs(
@@ -4639,7 +4605,7 @@ def _validate_task4_wrapper_inputs(
     if cu_seqlens.ndim != 1:
         raise ValueError(f"cu_seqlens must be 1D, got {cu_seqlens.ndim}D")
 
-    metadata = _get_cu_seqlens_metadata(cu_seqlens)
+    metadata = get_cu_seqlens_metadata(cu_seqlens)
     if metadata["num_seqs"] < 1:
         raise ValueError("cu_seqlens must describe at least one sequence.")
     if metadata["first"] != 0:
@@ -4687,6 +4653,7 @@ def chunk_gated_delta_rule(
     if cu_seqlens is None:
         raise ValueError("Task 4 wrapper requires cu_seqlens.")
     metadata = _validate_task4_wrapper_inputs(q, k, v, g, beta, initial_state, cu_seqlens)
+    normalized_scale = q.shape[-1] ** -0.5 if scale is None else scale
 
     # Allocate output if needed
     output = torch.empty_like(v)
@@ -4727,7 +4694,7 @@ def chunk_gated_delta_rule(
         is_varlen,
         is_initial_state,
         is_output_state,
-        scale,
+        normalized_scale,
     )
     cache = _get_compiled_gdn_prefill_kernel(*cache_key)
 
@@ -4771,7 +4738,7 @@ def chunk_gated_delta_rule(
             problem_size,
             state_tensor.iterator if state_tensor is not None else None,
             state_output_tensor.iterator if state_output_tensor is not None else None,
-            scale,
+            normalized_scale,
             cu_seqlens_tensor,
             stream=current_stream,
         )
@@ -4790,7 +4757,7 @@ def chunk_gated_delta_rule(
         problem_size,
         initial_state.data_ptr() if initial_state is not None else None,
         output_state.data_ptr() if output_state is not None else None,
-        scale,
+        normalized_scale,
         cu_seqlens,
         stream=current_stream,
     )

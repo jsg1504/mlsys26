@@ -1,9 +1,11 @@
 import sys
 from pathlib import Path
+from unittest import mock
 
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "solution" / "python"))
+import prefill_contract as pc
 from prefill_contract import prepare_g_beta, validate_inputs
 
 T = 16
@@ -109,3 +111,22 @@ except ValueError as exc:
     assert "shape" in str(exc)
 else:
     raise AssertionError("Expected ValueError for mismatched a and b shapes")
+
+pc._CU_SEQLENS_METADATA_CACHE.clear()
+tolist_calls = 0
+original_tolist = torch.Tensor.tolist
+
+
+def counting_tolist(self, *args, **kwargs):
+    global tolist_calls
+    tolist_calls += 1
+    return original_tolist(self, *args, **kwargs)
+
+
+with mock.patch.object(torch.Tensor, "item", side_effect=AssertionError("validate_inputs should not call Tensor.item()")), \
+     mock.patch("torch.any", side_effect=AssertionError("validate_inputs should not call torch.any()")), \
+     mock.patch.object(torch.Tensor, "tolist", counting_tolist):
+    validate_inputs(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens)
+    validate_inputs(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens)
+
+assert tolist_calls == 1

@@ -42,7 +42,7 @@ torch.testing.assert_close(calls["g"], expected_g)
 torch.testing.assert_close(calls["beta"], expected_beta)
 assert calls["initial_state"] is state
 assert calls["cu_seqlens"] is cu_seqlens
-assert calls["scale"] == 1.0
+assert calls["scale"] is None
 
 try:
     main.run(

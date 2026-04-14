@@ -28,7 +28,7 @@ def run(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, scale):
         **runtime_inputs,
         initial_state=state,
         cu_seqlens=cu_seqlens,
-        scale=1.0 if scale is None else scale,
+        scale=scale,
     )
 
     expected_output_shape = runtime_inputs["v"].shape

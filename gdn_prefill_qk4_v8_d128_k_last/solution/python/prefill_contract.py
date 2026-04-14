@@ -1,6 +1,8 @@
 import torch
 import torch.nn.functional as F
 
+_CU_SEQLENS_METADATA_CACHE = {}
+
 
 def prepare_g_beta(A_log, a, dt_bias, b):
     if not isinstance(A_log, torch.Tensor):
@@ -34,6 +36,38 @@ def prepare_g_beta(A_log, a, dt_bias, b):
     gate_log = -torch.exp(A_log.float()) * F.softplus(x)
     beta = torch.sigmoid(b.float())
     return gate_log, beta
+
+
+def get_cu_seqlens_metadata(cu_seqlens):
+    cache_key = (
+        cu_seqlens.device.type,
+        cu_seqlens.device.index,
+        cu_seqlens.data_ptr(),
+        cu_seqlens.numel(),
+        getattr(cu_seqlens, "_version", None),
+    )
+    cached = _CU_SEQLENS_METADATA_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    host_values = tuple(int(v) for v in cu_seqlens.detach().cpu().tolist())
+    num_seqs = len(host_values) - 1
+    max_s_q = max(
+        (host_values[i + 1] - host_values[i] for i in range(num_seqs)),
+        default=0,
+    )
+    metadata = {
+        "num_seqs": num_seqs,
+        "max_s_q": max_s_q,
+        "sum_s_q": host_values[-1] if host_values else 0,
+        "first": host_values[0] if host_values else None,
+        "last": host_values[-1] if host_values else None,
+        "nondecreasing": all(
+            host_values[i + 1] >= host_values[i] for i in range(len(host_values) - 1)
+        ),
+    }
+    _CU_SEQLENS_METADATA_CACHE[cache_key] = metadata
+    return metadata
 
 
 def validate_inputs(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens):
@@ -99,15 +133,16 @@ def validate_inputs(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens):
         raise ValueError(
             f"cu_seqlens must have shape (N + 1,) with N >= 1 and dtype torch.int64, got {tuple(cu_seqlens.shape)} and {cu_seqlens.dtype}"
         )
-    if state.shape[0] != cu_seqlens.shape[0] - 1:
+    metadata = get_cu_seqlens_metadata(cu_seqlens)
+    if state.shape[0] != metadata["num_seqs"]:
         raise ValueError(
-            f"state.shape[0] must match len(cu_seqlens) - 1, got {state.shape[0]} and {cu_seqlens.shape[0] - 1}"
+            f"state.shape[0] must match len(cu_seqlens) - 1, got {state.shape[0]} and {metadata['num_seqs']}"
         )
-    if cu_seqlens[0].item() != 0 or cu_seqlens[-1].item() != q.shape[0]:
+    if metadata["first"] != 0 or metadata["last"] != q.shape[0]:
         raise ValueError(
-            f"cu_seqlens must start at 0 and end at T, got {cu_seqlens.tolist()} and T={q.shape[0]}"
+            f"cu_seqlens must start at 0 and end at T={q.shape[0]}, got first={metadata['first']} and last={metadata['last']}"
         )
-    if torch.any(cu_seqlens[1:] < cu_seqlens[:-1]):
+    if not metadata["nondecreasing"]:
         raise ValueError(
-            f"cu_seqlens must be non-decreasing, got {cu_seqlens.tolist()}"
+            "cu_seqlens must be non-decreasing"
         )

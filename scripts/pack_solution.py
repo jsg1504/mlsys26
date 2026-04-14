@@ -21,6 +21,25 @@ from flashinfer_bench import BuildSpec
 from flashinfer_bench.agents import pack_solution_from_files
 
 
+def _get_source_dir(language: str, project_root: Path) -> Path:
+    mapping = {
+        "triton": project_root / "solution" / "triton",
+        "cuda": project_root / "solution" / "cuda",
+        "python": project_root / "solution" / "python",
+    }
+    return mapping[language]
+
+
+def _build_spec_from_config(build_config: dict) -> BuildSpec:
+    return BuildSpec(
+        language=build_config["language"],
+        target_hardware=["cuda"],
+        entry_point=build_config["entry_point"],
+        dependencies=build_config.get("dependencies", []),
+        destination_passing_style=build_config.get("destination_passing_style", True),
+    )
+
+
 def load_config() -> dict:
     """Load configuration from config.toml."""
     config_path = PROJECT_ROOT / "config.toml"
@@ -39,27 +58,13 @@ def pack_solution(output_path: Path = None) -> Path:
     build_config = config["build"]
 
     language = build_config["language"]
-    entry_point = build_config["entry_point"]
-
-    # Determine source directory based on language
-    if language == "triton":
-        source_dir = PROJECT_ROOT / "solution" / "triton"
-    elif language == "cuda":
-        source_dir = PROJECT_ROOT / "solution" / "cuda"
-    else:
-        raise ValueError(f"Unsupported language: {language}")
+    source_dir = _get_source_dir(language, PROJECT_ROOT)
 
     if not source_dir.exists():
         raise FileNotFoundError(f"Source directory not found: {source_dir}")
 
     # Create build spec
-    dps = build_config.get("destination_passing_style", True)
-    spec = BuildSpec(
-        language=language,
-        target_hardware=["cuda"],
-        entry_point=entry_point,
-        destination_passing_style=dps,
-    )
+    spec = _build_spec_from_config(build_config)
 
     # Pack the solution
     solution = pack_solution_from_files(

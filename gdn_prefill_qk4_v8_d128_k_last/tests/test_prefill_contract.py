@@ -45,3 +45,24 @@ except ValueError as exc:
     assert "state.shape" in str(exc)
 else:
     raise AssertionError("Expected ValueError for invalid state shape")
+
+try:
+    validate_inputs(
+        q.float(),
+        k,
+        v,
+        state,
+        A_log,
+        a,
+        dt_bias,
+        b,
+        cu_seqlens,
+    )
+except TypeError as exc:
+    assert "q.dtype" in str(exc)
+else:
+    raise AssertionError("Expected TypeError for invalid q dtype")
+
+multi_lengths = torch.tensor([0, 5, T], dtype=torch.int64)
+multi_state = torch.empty((2, 8, 128, 128), dtype=torch.float32)
+validate_inputs(q, k, v, multi_state, A_log, a, dt_bias, b, multi_lengths)

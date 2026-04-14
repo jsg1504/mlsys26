@@ -4,6 +4,7 @@ definition = "gdn_prefill_qk4_v8_d128_k_last"
 author = "KimJangMaengShin"
 
 [build]
-language = "cuda"
-entry_point = "kernel.cu::kernel"
-destination_passing_style = true
+language = "python"
+entry_point = "main.py::run"
+dependencies = ["nvidia-cutlass-dsl", "cuda-python"]
+destination_passing_style = false

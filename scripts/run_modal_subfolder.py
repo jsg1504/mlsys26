@@ -18,6 +18,8 @@ app = modal.App("flashinfer-bench")
 
 trace_volume = modal.Volume.from_name("flashinfer-trace", create_if_missing=True)
 TRACE_SET_PATH = "/data"
+DEFAULT_BENCHMARK_TIMEOUT_SECONDS = 300
+QUICK_BENCHMARK_TIMEOUT_SECONDS = 120
 
 image = (
     modal.Image.from_registry(
@@ -84,6 +86,29 @@ def run_benchmark(solution: Solution, config: BenchmarkConfig = None) -> dict:
     return results
 
 
+def build_benchmark_config(quick: bool) -> BenchmarkConfig:
+    """Build the benchmark config for quick or full Modal runs."""
+    if quick:
+        return BenchmarkConfig(
+            warmup_runs=1,
+            iterations=3,
+            num_trials=1,
+            timeout_seconds=QUICK_BENCHMARK_TIMEOUT_SECONDS,
+        )
+
+    return BenchmarkConfig(
+        warmup_runs=3,
+        iterations=100,
+        num_trials=5,
+        timeout_seconds=DEFAULT_BENCHMARK_TIMEOUT_SECONDS,
+    )
+
+
+def print_phase(message: str):
+    """Print a short phase marker for Modal quick runs."""
+    print(f"[modal] {message}")
+
+
 def print_results(results: dict):
     """Print benchmark results in a formatted way."""
     for def_name, traces in results.items():
@@ -115,21 +140,24 @@ def main(subfolder: str, quick: bool = True):
         quick: Use fast config for development (default). Pass --no-quick for final submission.
     """
     import scripts.pack_solution as ps
+
     ps.PROJECT_ROOT = PROJECT_ROOT / subfolder
+
+    print_phase("Packing solution from source files...")
     solution_path = ps.pack_solution()
 
-    print("\nLoading solution...")
+    print_phase("Loading packed solution...")
     solution = Solution.model_validate_json(solution_path.read_text())
     print(f"Loaded: {solution.name} ({solution.definition})")
 
-    if quick:
-        config = BenchmarkConfig(warmup_runs=1, iterations=3, num_trials=1)
-        print("\nRunning benchmark on Modal B200 (quick mode)...")
-    else:
-        config = BenchmarkConfig(warmup_runs=3, iterations=100, num_trials=5)
-        print("\nRunning benchmark on Modal B200 (full mode)...")
+    config = build_benchmark_config(quick)
+    mode = "quick" if quick else "full"
+    print_phase(
+        f"Submitting benchmark to Modal B200 ({mode} mode, timeout {config.timeout_seconds}s)..."
+    )
 
     results = run_benchmark.remote(solution, config)
+    print_phase("Remote benchmark complete.")
 
     if not results:
         print("No results returned!")

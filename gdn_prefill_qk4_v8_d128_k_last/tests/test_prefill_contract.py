@@ -23,3 +23,25 @@ assert gate_log.dtype == torch.float32
 assert beta.dtype == torch.float32
 assert gate_log.shape == (T, 8)
 assert beta.shape == (T, 8)
+
+expected_gate_log = torch.full((T, 8), -torch.log(torch.tensor(2.0)), dtype=torch.float32)
+expected_beta = torch.full((T, 8), 0.5, dtype=torch.float32)
+torch.testing.assert_close(gate_log, expected_gate_log)
+torch.testing.assert_close(beta, expected_beta)
+
+try:
+    validate_inputs(
+        q,
+        k,
+        v,
+        torch.empty((2, 8, 128, 128), dtype=torch.float32),
+        A_log,
+        a,
+        dt_bias,
+        b,
+        cu_seqlens,
+    )
+except ValueError as exc:
+    assert "state.shape" in str(exc)
+else:
+    raise AssertionError("Expected ValueError for invalid state shape")

@@ -1,5 +1,6 @@
 # FlashInfer Competition
 solution.json
+.worktrees/
 
 # CUDA build artifacts
 *.o

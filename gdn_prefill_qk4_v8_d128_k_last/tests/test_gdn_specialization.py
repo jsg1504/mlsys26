@@ -6,6 +6,13 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "solution" / "python"))
 from gdn_blackwell.gdn import GDN
 
+try:
+    GDN(is_persistent=True)
+except ValueError as exc:
+    assert "non-persistent" in str(exc)
+else:
+    raise AssertionError("Task 5 runtime should reject persistent mode construction")
+
 
 assert GDN.can_implement(
     (1, 16, 4, 128),

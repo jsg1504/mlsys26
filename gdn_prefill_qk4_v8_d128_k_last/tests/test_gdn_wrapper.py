@@ -25,9 +25,9 @@ runtime_calls = {"launches": 0, "cache_keys": [], "compile_lookups": 0, "scales"
 compiled_cache = {}
 
 
-def fake_get_compiled(problem_size, dtype, is_varlen, is_initial_state, is_output_state, scale):
+def fake_get_compiled(problem_size, dtype, scale):
     runtime_calls["compile_lookups"] += 1
-    key = (problem_size, dtype, is_varlen, is_initial_state, is_output_state, scale)
+    key = (problem_size, dtype, scale)
     runtime_calls["cache_keys"].append(key)
     runtime_calls["scales"].append(scale)
     if key not in compiled_cache:

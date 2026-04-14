@@ -73,8 +73,10 @@ class GDN:
         chunk_size: Int32 = 128,  # Only 128 is supported in current version
         head_dim: Int32 = 128,  # Only 128 is supported in current version
     ):
+        if is_persistent:
+            raise ValueError("Task 5 runtime only supports non-persistent mode.")
         self.chunk_size = chunk_size
-        self.is_persistent = is_persistent
+        self.is_persistent = False
 
         self.head_dim = head_dim
         self.cta_tiler = (chunk_size, chunk_size, head_dim)
@@ -3812,10 +3814,10 @@ class GDN:
             cutlass.Int32,
             cutlass.Int32,
         ],
-        initial_state_f32_iter: Optional[cute.Pointer],
-        state_output: Optional[cute.Pointer],
+        initial_state_f32_iter: cute.Pointer,
+        state_output: cute.Pointer,
         scale: Optional[float],
-        cum_seqlen_q: Optional[cute.Tensor] = None,
+        cum_seqlen_q: cute.Tensor,
         stream: cuda.CUstream = None,
     ):
         """Host-side entry: build tensor layouts, TMA descriptors, smem storage, and launch the kernel."""
@@ -3823,16 +3825,16 @@ class GDN:
         b, s_q, s_sum, h_q, h_v, d = problem_size
 
         h_r = h_v // h_q
-        o_offset = 0 if cum_seqlen_q is None else (-s_q * d * h_r * h_q)
-        b_qk = b if cum_seqlen_q is None else s_sum
-        b_o = b if cum_seqlen_q is None else s_q * (1 + b)
-        b_v = b if cum_seqlen_q is None else s_sum
+        o_offset = -s_q * d * h_r * h_q
+        b_qk = s_sum
+        b_o = s_q * (1 + b)
+        b_v = s_sum
 
-        stride_b_qk = h_q * s_q * d if cum_seqlen_q is None else d * h_q
-        stride_b_vo = h_r * h_q * s_q * d if cum_seqlen_q is None else d * h_q * h_r
+        stride_b_qk = d * h_q
+        stride_b_vo = d * h_q * h_r
 
-        b_gb = b if cum_seqlen_q is None else 1
-        stride_b_gb = h_r * h_q * s_sum if cum_seqlen_q is None else 0
+        b_gb = 1
+        stride_b_gb = 0
         q_layout = cute.make_layout(
             (s_sum, d, ((h_r, h_q), b_qk)),
             stride=(d * h_q, 1, ((0, d), stride_b_qk)),
@@ -3870,16 +3872,8 @@ class GDN:
             ),
         )
 
-        state_input_f32 = (
-            None
-            if cutlass.const_expr(initial_state_f32_iter is None)
-            else cute.make_tensor(initial_state_f32_iter, state_layout)
-        )
-        state_output = (
-            None
-            if cutlass.const_expr(state_output is None)
-            else cute.make_tensor(state_output, state_layout)
-        )
+        state_input_f32 = cute.make_tensor(initial_state_f32_iter, state_layout)
+        state_output = cute.make_tensor(state_output, state_layout)
 
         gb_layout = cute.make_layout(
             (s_sum, 1, ((h_r, h_q), b_gb)),
@@ -3904,7 +3898,6 @@ class GDN:
         self.tile_sched_params, grid = self._compute_grid(
             cute.shape((s_q, d, ((h_r, h_q), b))),
             self.cta_tiler,
-            self.is_persistent,
         )
 
         self.q_major_mode = utils.LayoutEnum.from_tensor(q).mma_major_mode()
@@ -4489,10 +4482,9 @@ class GDN:
     def _compute_grid(
         o_shape: cute.Shape,
         cta_tiler: Tuple[int, int, int],
-        is_persistent: bool,
     ) -> Tuple[GdnStaticTileSchedulerParams, Tuple[int, int, int]]:
         tile_sched_params = create_gdn_static_tile_scheduler_params(
-            is_persistent,
+            False,
             (
                 cute.ceil_div(cute.size(o_shape[1]), cta_tiler[2]),
                 cute.size(o_shape[2][0]),
@@ -4504,7 +4496,7 @@ class GDN:
 
 
 # ============================================================================
-# Task 4 Submission Wrapper
+# Task 5 Submission Wrapper
 # ============================================================================
 
 
@@ -4528,9 +4520,6 @@ def _get_problem_size(q_shape, v_shape, num_seqs, max_s_q, sum_s_q):
 def _get_compiled_gdn_prefill_kernel(
     problem_size,
     dtype: torch.dtype,
-    is_varlen: bool,
-    is_initial_state: bool,
-    is_output_state: bool,
     scale: float,
 ):
     """Cache compiled kernel for given configuration."""
@@ -4679,24 +4668,15 @@ def chunk_gated_delta_rule(
         metadata["sum_s_q"],
     )
 
-    # Allocate output_state if needed, current alloc both case.
-    # TODO: Remove output_state when output_final_state is false.
     output_state = torch.empty(
         (problem_size[0], problem_size[4], problem_size[5], problem_size[5]),
         dtype=torch.float32,
         device=q.device,
     )
 
-    # Compile kernel with TVM FFI (cached)
-    is_varlen = cu_seqlens is not None
-    is_initial_state = initial_state is not None
-    is_output_state = output_state is not None
     cache_key = (
         problem_size,
         q.dtype,
-        is_varlen,
-        is_initial_state,
-        is_output_state,
         normalized_scale,
     )
     cache = _get_compiled_gdn_prefill_kernel(*cache_key)
@@ -4712,21 +4692,9 @@ def chunk_gated_delta_rule(
         o_tensor = from_dlpack(output, assumed_align=16, enable_tvm_ffi=True)
         gate_tensor = from_dlpack(g, assumed_align=16, enable_tvm_ffi=True)
         beta_tensor = from_dlpack(beta, assumed_align=16, enable_tvm_ffi=True)
-        cu_seqlens_tensor = (
-            from_dlpack(cu_seqlens, assumed_align=16, enable_tvm_ffi=True)
-            if cu_seqlens is not None
-            else None
-        )
-        state_tensor = (
-            from_dlpack(initial_state, assumed_align=16, enable_tvm_ffi=True)
-            if initial_state is not None
-            else None
-        )
-        state_output_tensor = (
-            from_dlpack(output_state, assumed_align=16, enable_tvm_ffi=True)
-            if output_state is not None
-            else None
-        )
+        cu_seqlens_tensor = from_dlpack(cu_seqlens, assumed_align=16, enable_tvm_ffi=True)
+        state_tensor = from_dlpack(initial_state, assumed_align=16, enable_tvm_ffi=True)
+        state_output_tensor = from_dlpack(output_state, assumed_align=16, enable_tvm_ffi=True)
 
         # Compile GDN kernel
         options = EnableTVMFFI
@@ -4739,8 +4707,8 @@ def chunk_gated_delta_rule(
             gate_tensor.iterator,
             beta_tensor.iterator,
             problem_size,
-            state_tensor.iterator if state_tensor is not None else None,
-            state_output_tensor.iterator if state_output_tensor is not None else None,
+            state_tensor.iterator,
+            state_output_tensor.iterator,
             normalized_scale,
             cu_seqlens_tensor,
             stream=current_stream,
@@ -4758,8 +4726,8 @@ def chunk_gated_delta_rule(
         g.data_ptr(),
         beta.data_ptr(),
         problem_size,
-        initial_state.data_ptr() if initial_state is not None else None,
-        output_state.data_ptr() if output_state is not None else None,
+        initial_state.data_ptr(),
+        output_state.data_ptr(),
         normalized_scale,
         cu_seqlens,
         stream=current_stream,

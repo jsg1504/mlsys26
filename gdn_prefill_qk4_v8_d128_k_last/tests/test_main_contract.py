@@ -45,6 +45,33 @@ assert calls["cu_seqlens"] is cu_seqlens
 assert calls["scale"] is None
 assert calls["path_name"] == "small"
 
+T_large = 1025
+q_large = torch.empty((T_large, 4, 128), dtype=torch.bfloat16)
+k_large = torch.empty((T_large, 4, 128), dtype=torch.bfloat16)
+v_large = torch.empty((T_large, 8, 128), dtype=torch.bfloat16)
+state_large = torch.empty((9, 8, 128, 128), dtype=torch.float32)
+a_large = torch.zeros((T_large, 8), dtype=torch.bfloat16)
+b_large = torch.zeros((T_large, 8), dtype=torch.bfloat16)
+cu_seqlens_large = torch.tensor([0, 1, 2, 3, 4, 5, 6, 7, 8, T_large], dtype=torch.int64)
+
+main.chunk_gated_delta_rule = fake_chunk_gated_delta_rule
+large_output, large_state = main.run(
+    q_large,
+    k_large,
+    v_large,
+    state_large,
+    A_log,
+    a_large,
+    dt_bias,
+    b_large,
+    cu_seqlens_large,
+    None,
+)
+assert large_output.shape == (T_large, 8, 128)
+assert large_state.shape == state_large.shape
+assert calls["path_name"] == "large"
+assert calls["cu_seqlens"] is cu_seqlens_large
+
 try:
     main.run(
         q.unsqueeze(0),

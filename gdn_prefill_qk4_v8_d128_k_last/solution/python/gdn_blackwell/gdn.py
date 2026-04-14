@@ -4497,13 +4497,13 @@ class GDN:
 
 
 # ============================================================================
-# Task 5 Submission Wrapper
+# Task 6 Submission Wrapper
 # ============================================================================
 
 
 @functools.lru_cache(maxsize=128)
 def _get_problem_size(q_shape, v_shape, num_seqs, max_s_q, sum_s_q):
-    """Compute problem_size from validated Task 4 host metadata.
+    """Compute concrete problem_size from validated Task 6 host metadata.
 
     Args:
         q_shape: Tuple of (b, s_q, h_q, d).
@@ -4524,8 +4524,8 @@ def _get_compiled_gdn_prefill_kernel(
     has_initial_state: bool,
     has_output_state: bool,
 ):
-    """Cache compiled kernel for given configuration."""
-    return {}
+    """Return the outer family cache bucket for the Task 6 seam."""
+    return {"compiled_by_signature": {}}
 
 
 def _get_dtype_name(dtype: torch.dtype) -> str:
@@ -4534,7 +4534,11 @@ def _get_dtype_name(dtype: torch.dtype) -> str:
     return str(dtype)
 
 
-def _validate_task4_wrapper_inputs(
+def _make_compiled_artifact_key(problem_size, normalized_scale):
+    return (problem_size, float(normalized_scale))
+
+
+def _validate_task6_wrapper_inputs(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -4654,14 +4658,19 @@ def chunk_gated_delta_rule(
         raise ValueError("Task 6 wrapper requires initial_state.")
     if cu_seqlens is None:
         raise ValueError("Task 6 wrapper requires cu_seqlens.")
-    metadata = _validate_task4_wrapper_inputs(q, k, v, g, beta, initial_state, cu_seqlens)
-    selected_path_name = (
-        choose_path(total_seq_len=metadata["sum_s_q"], num_seqs=metadata["num_seqs"])
-        if path_name is None
-        else path_name
+    metadata = _validate_task6_wrapper_inputs(q, k, v, g, beta, initial_state, cu_seqlens)
+    expected_path_name = choose_path(
+        total_seq_len=metadata["sum_s_q"],
+        num_seqs=metadata["num_seqs"],
     )
+    selected_path_name = expected_path_name if path_name is None else path_name
     if selected_path_name not in VALID_PATH_NAMES:
         raise ValueError(f"Unsupported path_name: {selected_path_name}")
+    if selected_path_name != expected_path_name:
+        raise ValueError(
+            f"path_name must match dispatch policy for this workload: "
+            f"expected {expected_path_name!r}, got {selected_path_name!r}"
+        )
     normalized_scale = q.shape[-1] ** -0.5 if scale is None else scale
 
     # Allocate output if needed
@@ -4691,19 +4700,19 @@ def chunk_gated_delta_rule(
         device=q.device,
     )
 
-    cache_key = (
-        *make_cache_key(
-            selected_path_name,
-            _get_dtype_name(q.dtype),
-            True,
-            True,
-        ),
+    family_cache_key = make_cache_key(
+        selected_path_name,
+        _get_dtype_name(q.dtype),
+        True,
+        True,
     )
-    cache = _get_compiled_gdn_prefill_kernel(*cache_key)
+    family_cache = _get_compiled_gdn_prefill_kernel(*family_cache_key)
+    compiled_cache = family_cache["compiled_by_signature"]
+    compiled_key = _make_compiled_artifact_key(problem_size, normalized_scale)
 
     current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
-    if "compiled_gdn" not in cache:
+    if compiled_key not in compiled_cache:
         # GDN kernel
         gdn = GDN()
         q_tensor = from_dlpack(q, assumed_align=16, enable_tvm_ffi=True)
@@ -4733,9 +4742,9 @@ def chunk_gated_delta_rule(
             cu_seqlens_tensor,
             stream=current_stream,
         )
-        cache["compiled_gdn"] = compiled_gdn
+        compiled_cache[compiled_key] = compiled_gdn
 
-    compiled_gdn = cache["compiled_gdn"]
+    compiled_gdn = compiled_cache[compiled_key]
 
     # Run GDN kernel
     compiled_gdn(

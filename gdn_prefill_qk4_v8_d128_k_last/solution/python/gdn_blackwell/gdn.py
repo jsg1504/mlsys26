@@ -4497,7 +4497,7 @@ class GDN:
 
 
 # ============================================================================
-# FlashInfer API Layer
+# Task 4 Submission Wrapper
 # ============================================================================
 
 
@@ -4546,20 +4546,28 @@ def chunk_gated_delta_rule(
     cu_seqlens: Optional[torch.Tensor] = None,
     scale: Optional[float] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Compile (on first call) and run the task-scoped GDN kernel wrapper.
+    """Compile (on first call) and run the Task 4 shell-only GDN wrapper.
 
     Args:
-        q, k: (B, T, H_qk, D) query and key tensors (f16/bf16).
-        v:     (B, T, H_v, D) value tensor (f16/bf16). H_v must be a multiple of H_qk.
-        g:     (1, total_seq_len, H_v) gate values (f32, log-space).
-        beta:  (1, total_seq_len, H_v) beta values (f32, sigmoid-space).
-        initial_state: (B, H_v, D, D) recurrent state (f32), or None for zero init.
-        cu_seqlens: Cumulative sequence lengths for variable-length batching.
+        q, k: (1, T, H_qk, D) query and key tensors from the current shell.
+        v:     (1, T, H_v, D) value tensor from the current shell.
+        g:     (1, T, H_v) gate values (f32, log-space).
+        beta:  (1, T, H_v) beta values (f32, sigmoid-space).
+        initial_state: Required recurrent state input with shape (N, H_v, D, D).
+        cu_seqlens: Required cumulative sequence lengths for the flat-varlen batch.
         scale: Scale factor for the attention scores. Defaults to 1/sqrt(D).
 
     Returns:
-        Tuple of `(output, output_state)` to match the approved host-side shell.
+        Tuple of `(output, output_state)` for the current shell only.
     """
+    if initial_state is None:
+        raise ValueError("Task 4 wrapper requires initial_state.")
+    if cu_seqlens is None:
+        raise ValueError("Task 4 wrapper requires cu_seqlens.")
+    if q.ndim != 4 or k.ndim != 4 or v.ndim != 4:
+        raise ValueError("Task 4 wrapper supports only batch-size-1 flat-varlen tensors.")
+    if q.shape[0] != 1 or k.shape[0] != 1 or v.shape[0] != 1:
+        raise ValueError("Task 4 wrapper supports only batch size 1.")
 
     # Allocate output if needed
     output = torch.empty_like(v)

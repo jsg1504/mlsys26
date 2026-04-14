@@ -18,6 +18,7 @@ try:
     data = json.loads(result_path.read_text())
 
     assert result_path == output_path
+    assert data["spec"]["language"] == "python"
     assert data["spec"]["entry_point"] == "main.py::run"
     assert {source["path"] for source in data["sources"]} >= {
         "main.py",

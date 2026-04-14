@@ -1,8 +1,13 @@
 import torch
 
-from gdn_blackwell import chunk_gated_delta_rule
-from gdn_blackwell.dispatch import choose_path
-from prefill_contract import get_cu_seqlens_metadata, prepare_g_beta, validate_inputs
+try:
+    from .gdn_blackwell import chunk_gated_delta_rule
+    from .gdn_blackwell.dispatch import choose_path
+    from .prefill_contract import get_cu_seqlens_metadata, prepare_g_beta, validate_inputs
+except ImportError:
+    from gdn_blackwell import chunk_gated_delta_rule
+    from gdn_blackwell.dispatch import choose_path
+    from prefill_contract import get_cu_seqlens_metadata, prepare_g_beta, validate_inputs
 
 
 def _prepare_runtime_inputs(q, k, v, g, beta):

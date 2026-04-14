@@ -44,8 +44,12 @@ from cutlass._mlir.dialects import nvvm
 
 import cuda.bindings.driver as cuda
 
-from gdn_blackwell.dispatch import VALID_PATH_NAMES, choose_path, make_cache_key
-from prefill_contract import get_cu_seqlens_metadata
+try:
+    from .dispatch import VALID_PATH_NAMES, choose_path, make_cache_key
+    from ..prefill_contract import get_cu_seqlens_metadata
+except ImportError:
+    from gdn_blackwell.dispatch import VALID_PATH_NAMES, choose_path, make_cache_key
+    from prefill_contract import get_cu_seqlens_metadata
 
 from .gdn_tile_scheduler import *
 from .gdn_helpers import *

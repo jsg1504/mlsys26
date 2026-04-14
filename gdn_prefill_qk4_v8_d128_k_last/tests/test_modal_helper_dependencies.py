@@ -123,3 +123,86 @@ def test_main_emits_phase_progress_and_uses_quick_timeout(monkeypatch, tmp_path)
     assert remote_calls[0][0].definition == "demo_def"
     assert remote_calls[0][1].timeout_seconds == 120
     assert captured_payload["text"] == solution_path.read_text(encoding="utf-8")
+
+
+def test_print_results_includes_evaluation_log(monkeypatch):
+    module = load_runner_module(monkeypatch)
+
+    output = StringIO()
+    results = {
+        "demo_def": {
+            "workload-uuid": {
+                "status": "RUNTIME_ERROR",
+                "log": "first line\nsecond line",
+            }
+        }
+    }
+
+    with redirect_stdout(output):
+        module.print_results(results)
+
+    text = output.getvalue()
+    assert "demo_def:" in text
+    assert "Workload workload..." in text
+    assert "evaluation.log:" in text
+    assert "first line" in text
+    assert "second line" in text
+
+
+def test_run_benchmark_preserves_evaluation_log_and_enables_logging(monkeypatch):
+    module = load_runner_module(monkeypatch)
+
+    configured = {}
+
+    def fake_enable_logging():
+        configured["called"] = True
+
+    monkeypatch.setattr(module, "configure_flashinfer_logging", fake_enable_logging)
+
+    class FakeLog:
+        status = types.SimpleNamespace(value="RUNTIME_ERROR")
+        log = "traceback here\nmore detail"
+        performance = None
+        correctness = None
+
+    class FakeTrace:
+        workload = types.SimpleNamespace(uuid="12345678-abcdef")
+        solution = "demo_solution"
+        evaluation = FakeLog()
+
+    class FakeBenchmark:
+        def __init__(self, trace_set, config):
+            self.trace_set = trace_set
+            self.config = config
+
+        def run_all(self, dump_traces=True):
+            return types.SimpleNamespace(
+                traces={"demo_def": [FakeTrace()]},
+            )
+
+    class FakeTraceSet:
+        def __init__(self, root=None, definitions=None, solutions=None, workloads=None, traces=None):
+            self.root = root
+            self.definitions = definitions or {}
+            self.solutions = solutions or {}
+            self.workloads = workloads or {}
+            self.traces = traces or {}
+
+        @classmethod
+        def from_path(cls, path):
+            return cls(
+                root=Path("/tmp"),
+                definitions={"demo_def": types.SimpleNamespace(name="demo_def")},
+                workloads={"demo_def": [types.SimpleNamespace(uuid="12345678-abcdef")]},
+            )
+
+    monkeypatch.setattr(module, "Benchmark", FakeBenchmark)
+    monkeypatch.setattr(module, "TraceSet", FakeTraceSet)
+
+    class FakeSolution:
+        definition = "demo_def"
+
+    result = module.run_benchmark(FakeSolution(), None)
+
+    assert configured["called"] is True
+    assert result["demo_def"]["12345678-abcdef"]["log"] == "traceback here\nmore detail"

@@ -5,6 +5,7 @@ Usage:
     modal run scripts/run_modal_subfolder.py --subfolder gdn_decode_qk4_v8_d128_k_last
 """
 
+import logging
 import sys
 from pathlib import Path
 
@@ -20,6 +21,23 @@ trace_volume = modal.Volume.from_name("flashinfer-trace", create_if_missing=True
 TRACE_SET_PATH = "/data"
 DEFAULT_BENCHMARK_TIMEOUT_SECONDS = 300
 QUICK_BENCHMARK_TIMEOUT_SECONDS = 120
+
+
+def configure_flashinfer_logging(level: int = logging.INFO):
+    """Enable FlashInfer-Bench logging for Modal runs."""
+    logger = logging.getLogger("flashinfer_bench")
+    logger.setLevel(level)
+    logger.propagate = False
+
+    if not any(isinstance(handler, logging.StreamHandler) for handler in logger.handlers):
+        handler = logging.StreamHandler()
+        handler.setFormatter(
+            logging.Formatter(
+                fmt="[%(asctime)s] %(levelname)s %(name)s: %(message)s",
+                datefmt="%H:%M:%S",
+            )
+        )
+        logger.addHandler(handler)
 
 image = (
     modal.Image.from_registry(
@@ -42,6 +60,8 @@ def run_benchmark(solution: Solution, config: BenchmarkConfig = None) -> dict:
     """Run benchmark on Modal B200 and return results."""
     if config is None:
         config = BenchmarkConfig(warmup_runs=3, iterations=100, num_trials=5)
+
+    configure_flashinfer_logging()
 
     trace_set = TraceSet.from_path(TRACE_SET_PATH)
 
@@ -74,6 +94,8 @@ def run_benchmark(solution: Solution, config: BenchmarkConfig = None) -> dict:
                 "status": trace.evaluation.status.value,
                 "solution": trace.solution,
             }
+            if trace.evaluation.log:
+                entry["log"] = trace.evaluation.log
             if trace.evaluation.performance:
                 entry["latency_ms"] = trace.evaluation.performance.latency_ms
                 entry["reference_latency_ms"] = trace.evaluation.performance.reference_latency_ms
@@ -129,6 +151,12 @@ def print_results(results: dict):
                 print(f" | abs_err={abs_err:.2e}, rel_err={rel_err:.2e}", end="")
 
             print()
+
+            log = result.get("log")
+            if log:
+                print("    evaluation.log:")
+                for line in log.rstrip().splitlines():
+                    print(f"      {line}")
 
 
 @app.local_entrypoint()

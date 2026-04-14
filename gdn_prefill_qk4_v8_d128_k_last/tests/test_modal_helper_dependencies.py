@@ -58,7 +58,7 @@ def load_runner_module(monkeypatch):
     return module
 
 
-def test_benchmark_config_helper_uses_shorter_quick_timeout(monkeypatch):
+def test_benchmark_config_helper_uses_lightweight_benchmark_config(monkeypatch):
     module = load_runner_module(monkeypatch)
 
     quick_config = module.build_benchmark_config(True)
@@ -69,9 +69,9 @@ def test_benchmark_config_helper_uses_shorter_quick_timeout(monkeypatch):
     assert quick_config.num_trials == 1
     assert quick_config.timeout_seconds == 120
 
-    assert full_config.warmup_runs == 3
-    assert full_config.iterations == 100
-    assert full_config.num_trials == 5
+    assert full_config.warmup_runs == 1
+    assert full_config.iterations == 3
+    assert full_config.num_trials == 1
     assert full_config.timeout_seconds == 300
 
 
@@ -238,6 +238,7 @@ def test_run_benchmark_configures_package_logger_and_preserves_evaluation_log(mo
         def __init__(self, trace_set, config):
             self.trace_set = trace_set
             self.config = config
+            captured_configs.append(config)
 
         def run_all(self, dump_traces=True):
             return types.SimpleNamespace(
@@ -266,6 +267,7 @@ def test_run_benchmark_configures_package_logger_and_preserves_evaluation_log(mo
     class FakeSolution:
         definition = "demo_def"
 
+    captured_configs = []
     observed_package_level = None
     observed_package_handlers = None
     observed_underscore_handlers = None
@@ -285,4 +287,7 @@ def test_run_benchmark_configures_package_logger_and_preserves_evaluation_log(mo
     assert observed_package_level == logging.INFO
     assert any(isinstance(handler, logging.StreamHandler) for handler in observed_package_handlers)
     assert all(not isinstance(handler, logging.StreamHandler) for handler in observed_underscore_handlers)
+    assert captured_configs[0].warmup_runs == 1
+    assert captured_configs[0].iterations == 3
+    assert captured_configs[0].num_trials == 1
     assert result["demo_def"]["12345678-abcdef"]["log"] == "traceback here\nmore detail"

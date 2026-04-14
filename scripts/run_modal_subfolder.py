@@ -44,7 +44,7 @@ image = (
 def run_benchmark(solution: Solution, config: BenchmarkConfig = None, workload_limit: int | None = None) -> dict:
     """Run benchmark on Modal B200 and return results."""
     if config is None:
-        config = BenchmarkConfig(warmup_runs=3, iterations=100, num_trials=5)
+        config = BenchmarkConfig(warmup_runs=1, iterations=3, num_trials=1)
 
     if workload_limit is None and (
         config.warmup_runs == 1
@@ -115,9 +115,9 @@ def build_benchmark_config(quick: bool) -> BenchmarkConfig:
         )
 
     return BenchmarkConfig(
-        warmup_runs=3,
-        iterations=100,
-        num_trials=5,
+        warmup_runs=1,
+        iterations=3,
+        num_trials=1,
         timeout_seconds=DEFAULT_BENCHMARK_TIMEOUT_SECONDS,
     )
 

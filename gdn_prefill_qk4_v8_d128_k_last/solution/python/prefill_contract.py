@@ -1,5 +1,6 @@
 import torch
 import torch.nn.functional as F
+import weakref
 
 _CU_SEQLENS_METADATA_CACHE = {}
 
@@ -39,16 +40,13 @@ def prepare_g_beta(A_log, a, dt_bias, b):
 
 
 def get_cu_seqlens_metadata(cu_seqlens):
-    cache_key = (
-        cu_seqlens.device.type,
-        cu_seqlens.device.index,
-        cu_seqlens.data_ptr(),
-        cu_seqlens.numel(),
-        getattr(cu_seqlens, "_version", None),
-    )
+    cache_key = id(cu_seqlens)
+    version = getattr(cu_seqlens, "_version", None)
     cached = _CU_SEQLENS_METADATA_CACHE.get(cache_key)
     if cached is not None:
-        return cached
+        cached_ref, cached_version, cached_metadata = cached
+        if cached_ref() is cu_seqlens and cached_version == version:
+            return cached_metadata
 
     host_values = tuple(int(v) for v in cu_seqlens.detach().cpu().tolist())
     num_seqs = len(host_values) - 1
@@ -66,7 +64,15 @@ def get_cu_seqlens_metadata(cu_seqlens):
             host_values[i + 1] >= host_values[i] for i in range(len(host_values) - 1)
         ),
     }
-    _CU_SEQLENS_METADATA_CACHE[cache_key] = metadata
+
+    def _remove_stale_entry(_ref, *, cache_key=cache_key):
+        _CU_SEQLENS_METADATA_CACHE.pop(cache_key, None)
+
+    _CU_SEQLENS_METADATA_CACHE[cache_key] = (
+        weakref.ref(cu_seqlens, _remove_stale_entry),
+        version,
+        metadata,
+    )
     return metadata
 
 

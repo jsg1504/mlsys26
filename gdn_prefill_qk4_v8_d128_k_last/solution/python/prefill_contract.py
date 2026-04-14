@@ -21,12 +21,14 @@ def prepare_g_beta(A_log, a, dt_bias, b):
         raise TypeError(f"b.dtype must be torch.bfloat16, got {b.dtype}")
     if A_log.shape != (8,):
         raise ValueError(f"A_log.shape must be (8,), got {tuple(A_log.shape)}")
-    if a.shape[1:] != (8,):
+    if a.ndim != 2 or a.shape[1] != 8:
         raise ValueError(f"a.shape must be (T, 8), got {tuple(a.shape)}")
     if dt_bias.shape != (8,):
         raise ValueError(f"dt_bias.shape must be (8,), got {tuple(dt_bias.shape)}")
-    if b.shape[1:] != (8,):
+    if b.ndim != 2 or b.shape[1] != 8:
         raise ValueError(f"b.shape must be (T, 8), got {tuple(b.shape)}")
+    if a.shape != b.shape:
+        raise ValueError(f"a.shape and b.shape must match, got {tuple(a.shape)} and {tuple(b.shape)}")
 
     x = a.float() + dt_bias.float()
     gate_log = -torch.exp(A_log.float()) * F.softplus(x)

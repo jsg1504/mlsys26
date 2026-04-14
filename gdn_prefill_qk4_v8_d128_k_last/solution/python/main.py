@@ -1,3 +1,5 @@
+import torch
+
 from gdn_blackwell import chunk_gated_delta_rule
 from prefill_contract import prepare_g_beta, validate_inputs
 
@@ -27,5 +29,21 @@ def run(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, scale):
         cu_seqlens=cu_seqlens,
         scale=1.0 if scale is None else scale,
     )
+
+    expected_output_shape = runtime_inputs["v"].shape
+    if not isinstance(output, torch.Tensor):
+        raise TypeError(f"chunk_gated_delta_rule output must be a torch.Tensor, got {type(output).__name__}")
+    if output.shape != expected_output_shape:
+        raise ValueError(
+            f"chunk_gated_delta_rule output.shape must be {tuple(expected_output_shape)}, got {tuple(output.shape)}"
+        )
+    if not isinstance(new_state, torch.Tensor):
+        raise TypeError(
+            f"chunk_gated_delta_rule new_state must be a torch.Tensor, got {type(new_state).__name__}"
+        )
+    if new_state.shape != state.shape:
+        raise ValueError(
+            f"chunk_gated_delta_rule new_state.shape must be {tuple(state.shape)}, got {tuple(new_state.shape)}"
+        )
 
     return output.squeeze(0), new_state

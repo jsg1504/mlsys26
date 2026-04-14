@@ -61,3 +61,19 @@ except ValueError as exc:
     assert "flat varlen" in str(exc)
 else:
     raise AssertionError("Expected ValueError for pseudo-batched main.run inputs")
+
+
+def fake_bad_chunk_gated_delta_rule(**kwargs):
+    bad_output = torch.empty((T, 8, 128), dtype=torch.bfloat16)
+    bad_state = torch.empty((1, 8, 128), dtype=torch.float32)
+    return bad_output, bad_state
+
+
+main.chunk_gated_delta_rule = fake_bad_chunk_gated_delta_rule
+
+try:
+    main.run(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, None)
+except ValueError as exc:
+    assert "output" in str(exc) or "new_state" in str(exc)
+else:
+    raise AssertionError("Expected ValueError for malformed chunk_gated_delta_rule return")

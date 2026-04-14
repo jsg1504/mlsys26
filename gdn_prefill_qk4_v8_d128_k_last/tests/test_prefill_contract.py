@@ -80,3 +80,15 @@ except TypeError as exc:
     assert "b.dtype" in str(exc)
 else:
     raise AssertionError("Expected TypeError for invalid b dtype")
+
+try:
+    prepare_g_beta(
+        A_log,
+        torch.zeros((T, 8), dtype=torch.bfloat16),
+        dt_bias,
+        torch.zeros((T + 1, 8), dtype=torch.bfloat16),
+    )
+except ValueError as exc:
+    assert "shape" in str(exc)
+else:
+    raise AssertionError("Expected ValueError for mismatched a and b shapes")

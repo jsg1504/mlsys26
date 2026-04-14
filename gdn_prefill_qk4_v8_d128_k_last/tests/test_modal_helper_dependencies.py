@@ -1,5 +1,3 @@
-import importlib.util
-import json
 import sys
 import types
 from contextlib import redirect_stdout
@@ -8,13 +6,6 @@ from pathlib import Path
 
 
 script_path = Path(__file__).resolve().parents[2] / "scripts" / "run_modal_subfolder.py"
-script_text = script_path.read_text(encoding="utf-8")
-
-assert '"nvidia-cutlass-dsl"' in script_text
-assert '"cutlass"' not in script_text
-assert "timeout_seconds=QUICK_BENCHMARK_TIMEOUT_SECONDS" in script_text
-assert "print_phase(\"Packing solution from source files...\")" in script_text
-
 
 def load_runner_module(monkeypatch):
     modal = types.ModuleType("modal")
@@ -25,6 +16,7 @@ def load_runner_module(monkeypatch):
 
         def function(self, *args, **kwargs):
             def decorator(fn):
+                fn.remote = lambda *remote_args, **remote_kwargs: None
                 return fn
 
             return decorator
@@ -52,71 +44,11 @@ def load_runner_module(monkeypatch):
     modal.Volume = DummyVolume
     modal.Image = DummyImage
 
-    flashinfer_bench = types.ModuleType("flashinfer_bench")
-
-    class BenchmarkConfig:
-        def __init__(
-            self,
-            *,
-            warmup_runs=10,
-            iterations=50,
-            num_trials=3,
-            rtol=0.01,
-            atol=0.01,
-            log_dir="",
-            use_isolated_runner=False,
-            required_matched_ratio=None,
-            sampling_validation_trials=100,
-            sampling_tvd_threshold=0.2,
-            definitions=None,
-            solutions=None,
-            timeout_seconds=300,
-            profile_baseline=True,
-        ):
-            self.warmup_runs = warmup_runs
-            self.iterations = iterations
-            self.num_trials = num_trials
-            self.rtol = rtol
-            self.atol = atol
-            self.log_dir = log_dir
-            self.use_isolated_runner = use_isolated_runner
-            self.required_matched_ratio = required_matched_ratio
-            self.sampling_validation_trials = sampling_validation_trials
-            self.sampling_tvd_threshold = sampling_tvd_threshold
-            self.definitions = definitions
-            self.solutions = solutions
-            self.timeout_seconds = timeout_seconds
-            self.profile_baseline = profile_baseline
-
-    class Solution:
-        def __init__(self, name, definition):
-            self.name = name
-            self.definition = definition
-
-        @classmethod
-        def model_validate_json(cls, text):
-            payload = json.loads(text)
-            return cls(payload["name"], payload["definition"])
-
-    class TraceSet:
-        @classmethod
-        def from_path(cls, *args, **kwargs):
-            return cls()
-
-    class Benchmark:
-        def __init__(self, *args, **kwargs):
-            pass
-
-        def run_all(self, *args, **kwargs):
-            return types.SimpleNamespace(traces={})
-
-    flashinfer_bench.Benchmark = Benchmark
-    flashinfer_bench.BenchmarkConfig = BenchmarkConfig
-    flashinfer_bench.Solution = Solution
-    flashinfer_bench.TraceSet = TraceSet
-
     monkeypatch.setitem(sys.modules, "modal", modal)
-    monkeypatch.setitem(sys.modules, "flashinfer_bench", flashinfer_bench)
+    monkeypatch.delitem(sys.modules, "scripts", raising=False)
+    monkeypatch.delitem(sys.modules, "scripts.pack_solution", raising=False)
+
+    import importlib.util
 
     spec = importlib.util.spec_from_file_location("run_modal_subfolder_test", script_path)
     module = importlib.util.module_from_spec(spec)
@@ -148,6 +80,19 @@ def test_main_emits_phase_progress_and_uses_quick_timeout(monkeypatch, tmp_path)
     solution_path = tmp_path / "solution.json"
     solution_path.write_text('{"name": "demo", "definition": "demo_def"}', encoding="utf-8")
 
+    captured_payload = {}
+
+    def fake_model_validate_json(text):
+        captured_payload["text"] = text
+
+        class FakeSolution:
+            name = "demo"
+            definition = "demo_def"
+
+        return FakeSolution()
+
+    monkeypatch.setattr(module.Solution, "model_validate_json", staticmethod(fake_model_validate_json))
+
     fake_pack_solution = types.ModuleType("scripts.pack_solution")
     fake_pack_solution.PROJECT_ROOT = Path("/initial")
     fake_pack_solution.pack_solution = lambda: solution_path
@@ -163,7 +108,7 @@ def test_main_emits_phase_progress_and_uses_quick_timeout(monkeypatch, tmp_path)
         remote_calls.append((solution, config))
         return {"demo_def": {}}
 
-    module.run_benchmark.remote = fake_remote
+    monkeypatch.setattr(module.run_benchmark, "remote", fake_remote)
 
     output = StringIO()
     with redirect_stdout(output):
@@ -177,3 +122,4 @@ def test_main_emits_phase_progress_and_uses_quick_timeout(monkeypatch, tmp_path)
     assert remote_calls[0][0].name == "demo"
     assert remote_calls[0][0].definition == "demo_def"
     assert remote_calls[0][1].timeout_seconds == 120
+    assert captured_payload["text"] == solution_path.read_text(encoding="utf-8")

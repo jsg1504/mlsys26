@@ -14,6 +14,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 import modal
 from flashinfer_bench import Benchmark, BenchmarkConfig, Solution, TraceSet
+from flashinfer_bench.logging import configure_logging
 
 app = modal.App("flashinfer-bench")
 
@@ -21,23 +22,6 @@ trace_volume = modal.Volume.from_name("flashinfer-trace", create_if_missing=True
 TRACE_SET_PATH = "/data"
 DEFAULT_BENCHMARK_TIMEOUT_SECONDS = 300
 QUICK_BENCHMARK_TIMEOUT_SECONDS = 120
-
-
-def configure_flashinfer_logging(level: int = logging.INFO):
-    """Enable FlashInfer-Bench logging for Modal runs."""
-    logger = logging.getLogger("flashinfer_bench")
-    logger.setLevel(level)
-    logger.propagate = False
-
-    if not any(isinstance(handler, logging.StreamHandler) for handler in logger.handlers):
-        handler = logging.StreamHandler()
-        handler.setFormatter(
-            logging.Formatter(
-                fmt="[%(asctime)s] %(levelname)s %(name)s: %(message)s",
-                datefmt="%H:%M:%S",
-            )
-        )
-        logger.addHandler(handler)
 
 image = (
     modal.Image.from_registry(
@@ -61,7 +45,7 @@ def run_benchmark(solution: Solution, config: BenchmarkConfig = None) -> dict:
     if config is None:
         config = BenchmarkConfig(warmup_runs=3, iterations=100, num_trials=5)
 
-    configure_flashinfer_logging()
+    configure_logging(level=logging.INFO)
 
     trace_set = TraceSet.from_path(TRACE_SET_PATH)
 

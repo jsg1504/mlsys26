@@ -1,3 +1,4 @@
+import logging
 import sys
 import types
 from contextlib import redirect_stdout
@@ -149,15 +150,17 @@ def test_print_results_includes_evaluation_log(monkeypatch):
     assert "second line" in text
 
 
-def test_run_benchmark_preserves_evaluation_log_and_enables_logging(monkeypatch):
+def test_run_benchmark_configures_package_logger_and_preserves_evaluation_log(monkeypatch):
     module = load_runner_module(monkeypatch)
 
-    configured = {}
+    package_logger = logging.getLogger("flashinfer-bench")
+    underscored_logger = logging.getLogger("flashinfer_bench")
 
-    def fake_enable_logging():
-        configured["called"] = True
-
-    monkeypatch.setattr(module, "configure_flashinfer_logging", fake_enable_logging)
+    original_package_handlers = list(package_logger.handlers)
+    original_package_level = package_logger.level
+    original_package_propagate = package_logger.propagate
+    original_underscore_handlers = list(underscored_logger.handlers)
+    original_underscore_level = underscored_logger.level
 
     class FakeLog:
         status = types.SimpleNamespace(value="RUNTIME_ERROR")
@@ -202,7 +205,23 @@ def test_run_benchmark_preserves_evaluation_log_and_enables_logging(monkeypatch)
     class FakeSolution:
         definition = "demo_def"
 
-    result = module.run_benchmark(FakeSolution(), None)
+    observed_package_level = None
+    observed_package_handlers = None
+    observed_underscore_handlers = None
 
-    assert configured["called"] is True
+    try:
+        result = module.run_benchmark(FakeSolution(), None)
+        observed_package_level = package_logger.level
+        observed_package_handlers = list(package_logger.handlers)
+        observed_underscore_handlers = list(underscored_logger.handlers)
+    finally:
+        package_logger.handlers = original_package_handlers
+        package_logger.setLevel(original_package_level)
+        package_logger.propagate = original_package_propagate
+        underscored_logger.handlers = original_underscore_handlers
+        underscored_logger.setLevel(original_underscore_level)
+
+    assert observed_package_level == logging.INFO
+    assert any(isinstance(handler, logging.StreamHandler) for handler in observed_package_handlers)
+    assert all(not isinstance(handler, logging.StreamHandler) for handler in observed_underscore_handlers)
     assert result["demo_def"]["12345678-abcdef"]["log"] == "traceback here\nmore detail"

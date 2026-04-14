@@ -53,6 +53,8 @@ def validate_inputs(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens):
 
     if q.shape != k.shape:
         raise ValueError(f"q.shape and k.shape must match, got {tuple(q.shape)} and {tuple(k.shape)}")
+    if v.shape[0] != q.shape[0]:
+        raise ValueError(f"v.shape[0] must match q.shape[0], got {v.shape[0]} and {q.shape[0]}")
     if q.dtype != torch.bfloat16:
         raise TypeError(f"q.dtype must be torch.bfloat16, got {q.dtype}")
     if k.dtype != torch.bfloat16:

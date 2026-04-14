@@ -33,8 +33,12 @@ with tempfile.TemporaryDirectory() as tmpdir:
     (tmp_path / "main.py").write_text("def run():\n    pass\n")
     nested = tmp_path / "gdn_blackwell"
     nested.mkdir()
+    deeper = nested / "submodule"
+    deeper.mkdir()
     (nested / "__init__.py").write_text("from .gdn import chunk_gated_delta_rule\n")
     (nested / "gdn.py").write_text("value = 1\n")
+    (nested / "kernel.cc").write_text("int kernel() { return 0; }\n")
+    (deeper / "helper.cxx").write_text("int helper() { return 1; }\n")
 
     packed = ps._pack_python_solution_from_files(
         path=str(tmp_path),
@@ -47,5 +51,7 @@ with tempfile.TemporaryDirectory() as tmpdir:
     assert [source.path for source in packed.sources] == [
         "gdn_blackwell/__init__.py",
         "gdn_blackwell/gdn.py",
+        "gdn_blackwell/kernel.cc",
+        "gdn_blackwell/submodule/helper.cxx",
         "main.py",
     ]

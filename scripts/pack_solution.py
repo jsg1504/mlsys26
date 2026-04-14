@@ -63,7 +63,7 @@ def _pack_python_solution_from_files(
             continue
 
         ext = file_path.suffix.lower()
-        if ext not in {".py", ".cu", ".cuh", ".cpp", ".c", ".h", ".hpp"}:
+        if ext not in {".py", ".cu", ".cuh", ".cpp", ".cc", ".cxx", ".c", ".h", ".hpp"}:
             continue
 
         with open(file_path, "r", encoding="utf-8") as f:

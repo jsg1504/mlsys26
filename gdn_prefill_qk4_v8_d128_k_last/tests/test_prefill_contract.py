@@ -52,6 +52,23 @@ try:
     validate_inputs(
         q,
         k,
+        torch.empty((T, 7, 128), dtype=torch.bfloat16),
+        state,
+        A_log,
+        a,
+        dt_bias,
+        b,
+        cu_seqlens,
+    )
+except ValueError as exc:
+    assert "v.shape" in str(exc)
+else:
+    raise AssertionError("Expected ValueError for invalid v head count")
+
+try:
+    validate_inputs(
+        q,
+        k,
         v,
         torch.empty((2, 8, 128, 128), dtype=torch.float32),
         A_log,

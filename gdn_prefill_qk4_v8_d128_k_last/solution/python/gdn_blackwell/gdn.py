@@ -198,7 +198,11 @@ class GDN:
             can_implement = False
 
         if b != b_:
-            warnings.warn("q & k must have the same batch size", stacklevel=2)
+            warnings.warn("q & v must have the same batch size", stacklevel=2)
+            can_implement = False
+
+        if b != 1:
+            warnings.warn("Task 5 runtime only supports batch size 1", stacklevel=2)
             can_implement = False
 
         if d != d_:
@@ -210,9 +214,12 @@ class GDN:
             warnings.warn("head dimension must be 128", stacklevel=2)
             can_implement = False
 
-        if h_v % h_q != 0:
-            warnings.warn("h_v must be divisible by h_q", stacklevel=2)
+        if h_q != 4:
+            warnings.warn("Task 5 runtime requires q/k head count 4", stacklevel=2)
+            can_implement = False
 
+        if h_v != 8:
+            warnings.warn("Task 5 runtime requires v head count 8", stacklevel=2)
             can_implement = False
 
         if isinstance(s_q, tuple) and len(s_q) != b:
@@ -223,24 +230,20 @@ class GDN:
 
         if in_dtype not in {
             cutlass.BFloat16,
-            cutlass.Float16,
-            torch.float16,
             torch.bfloat16,
         }:
             warnings.warn(
-                "in_dtype must be BFloat16 or Float16 or torch.float16 or torch.bfloat16",
+                "Task 5 runtime requires bfloat16 q/k/v inputs",
                 stacklevel=2,
             )
             can_implement = False
 
         if out_dtype not in {
             cutlass.BFloat16,
-            cutlass.Float16,
-            torch.float16,
             torch.bfloat16,
         }:
             warnings.warn(
-                "out_dtype must be BFloat16 or Float16 or torch.float16 or torch.bfloat16",
+                "Task 5 runtime requires bfloat16 outputs",
                 stacklevel=2,
             )
             can_implement = False

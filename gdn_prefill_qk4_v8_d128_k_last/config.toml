@@ -6,5 +6,5 @@ author = "KimJangMaengShin"
 [build]
 language = "python"
 entry_point = "main.py::run"
-dependencies = ["cutlass", "cuda-python"]
+dependencies = ["nvidia-cutlass-dsl", "cuda-python"]
 destination_passing_style = false

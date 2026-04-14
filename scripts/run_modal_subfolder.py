@@ -24,7 +24,14 @@ image = (
         "nvidia/cuda:12.8.1-devel-ubuntu22.04",
         add_python="3.12",
     )
-    .pip_install("flashinfer-bench", "torch", "triton", "numpy", "cutlass", "cuda-python")
+    .pip_install(
+        "flashinfer-bench",
+        "torch",
+        "triton",
+        "numpy",
+        "nvidia-cutlass-dsl",
+        "cuda-python",
+    )
 )
 
 

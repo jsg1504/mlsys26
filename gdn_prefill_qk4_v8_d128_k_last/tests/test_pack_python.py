@@ -19,13 +19,13 @@ spec = ps._build_spec_from_config(
     {
         "language": "python",
         "entry_point": "main.py::run",
-        "dependencies": ["cutlass", "cuda-python"],
+        "dependencies": ["nvidia-cutlass-dsl", "cuda-python"],
         "destination_passing_style": False,
     }
 )
 assert spec.language == "python"
 assert spec.entry_point == "main.py::run"
-assert spec.dependencies == ["cutlass", "cuda-python"]
+assert spec.dependencies == ["nvidia-cutlass-dsl", "cuda-python"]
 assert spec.destination_passing_style is False
 
 with tempfile.TemporaryDirectory() as tmpdir:

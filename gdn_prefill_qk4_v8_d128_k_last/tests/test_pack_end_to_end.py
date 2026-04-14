@@ -20,6 +20,8 @@ try:
     assert result_path == output_path
     assert data["spec"]["language"] == "python"
     assert data["spec"]["entry_point"] == "main.py::run"
+    assert data["spec"]["dependencies"] == ["nvidia-cutlass-dsl", "cuda-python"]
+    assert "cutlass" not in data["spec"]["dependencies"]
     assert {source["path"] for source in data["sources"]} >= {
         "main.py",
         "prefill_contract.py",

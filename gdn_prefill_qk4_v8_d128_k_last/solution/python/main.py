@@ -1,7 +1,8 @@
 import torch
 
 from gdn_blackwell import chunk_gated_delta_rule
-from prefill_contract import prepare_g_beta, validate_inputs
+from gdn_blackwell.dispatch import choose_path
+from prefill_contract import get_cu_seqlens_metadata, prepare_g_beta, validate_inputs
 
 
 def _prepare_runtime_inputs(q, k, v, g, beta):
@@ -21,14 +22,20 @@ def run(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, scale):
         if q.ndim != 3 or k.ndim != 3 or v.ndim != 3:
             raise ValueError("main.run currently accepts only flat varlen inputs for q, k, and v.")
     validate_inputs(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens)
+    cu_metadata = get_cu_seqlens_metadata(cu_seqlens)
     gate_log, beta = prepare_g_beta(A_log, a, dt_bias, b)
     runtime_inputs = _prepare_runtime_inputs(q, k, v, gate_log, beta)
+    path_name = choose_path(
+        total_seq_len=cu_metadata["sum_s_q"],
+        num_seqs=cu_metadata["num_seqs"],
+    )
 
     output, new_state = chunk_gated_delta_rule(
         **runtime_inputs,
         initial_state=state,
         cu_seqlens=cu_seqlens,
         scale=scale,
+        path_name=path_name,
     )
 
     expected_output_shape = runtime_inputs["v"].shape

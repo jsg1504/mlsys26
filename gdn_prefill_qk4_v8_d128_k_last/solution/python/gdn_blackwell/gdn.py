@@ -18,11 +18,11 @@ limitations under the License.
 #
 # Implements the Chunk-wise Gated Delta Rule linear attention using CuTe-DSL,
 # for Blackwell Architecture.
-# This file is vendored from the released baseline runtime. Task 5 local edits are
+# This file is vendored from the released baseline runtime. Task 6 local edits are
 # intentionally confined to the specialized submission seam and its small metadata helpers
 # near the bottom of the file.
 #
-# Task 5 submission contract:
+# Task 6 submission contract:
 #   - varlen prefill only
 #   - non-persistent scheduling only
 #   - q/k heads == 4, v heads == 8, head dim == 128
@@ -44,6 +44,7 @@ from cutlass._mlir.dialects import nvvm
 
 import cuda.bindings.driver as cuda
 
+from gdn_blackwell.dispatch import VALID_PATH_NAMES, choose_path, make_cache_key
 from prefill_contract import get_cu_seqlens_metadata
 
 from .gdn_tile_scheduler import *
@@ -4518,12 +4519,19 @@ def _get_problem_size(q_shape, v_shape, num_seqs, max_s_q, sum_s_q):
 
 @functools.cache
 def _get_compiled_gdn_prefill_kernel(
-    problem_size,
-    dtype: torch.dtype,
-    scale: float,
+    path_name: str,
+    dtype_name: str,
+    has_initial_state: bool,
+    has_output_state: bool,
 ):
     """Cache compiled kernel for given configuration."""
     return {}
+
+
+def _get_dtype_name(dtype: torch.dtype) -> str:
+    if dtype == torch.bfloat16:
+        return "bf16"
+    return str(dtype)
 
 
 def _validate_task4_wrapper_inputs(
@@ -4625,8 +4633,9 @@ def chunk_gated_delta_rule(
     initial_state: Optional[torch.Tensor] = None,
     cu_seqlens: Optional[torch.Tensor] = None,
     scale: Optional[float] = None,
+    path_name: Optional[str] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Compile (on first call) and run the Task 5 shell-only GDN wrapper.
+    """Compile (on first call) and run the Task 6 shell-only GDN wrapper.
 
     Args:
         q, k: (1, T, H_qk, D) query and key tensors from the current shell.
@@ -4636,15 +4645,23 @@ def chunk_gated_delta_rule(
         initial_state: Required recurrent state input with shape (N, H_v, D, D).
         cu_seqlens: Required cumulative sequence lengths for the flat-varlen batch.
         scale: Scale factor for the attention scores. Defaults to 1/sqrt(D).
+        path_name: Optional dispatch family name for the Task 6 seam.
 
     Returns:
-        Tuple of `(output, output_state)` for the Task 5 runtime seam only.
+        Tuple of `(output, output_state)` for the Task 6 runtime seam only.
     """
     if initial_state is None:
-        raise ValueError("Task 5 wrapper requires initial_state.")
+        raise ValueError("Task 6 wrapper requires initial_state.")
     if cu_seqlens is None:
-        raise ValueError("Task 5 wrapper requires cu_seqlens.")
+        raise ValueError("Task 6 wrapper requires cu_seqlens.")
     metadata = _validate_task4_wrapper_inputs(q, k, v, g, beta, initial_state, cu_seqlens)
+    selected_path_name = (
+        choose_path(total_seq_len=metadata["sum_s_q"], num_seqs=metadata["num_seqs"])
+        if path_name is None
+        else path_name
+    )
+    if selected_path_name not in VALID_PATH_NAMES:
+        raise ValueError(f"Unsupported path_name: {selected_path_name}")
     normalized_scale = q.shape[-1] ** -0.5 if scale is None else scale
 
     # Allocate output if needed
@@ -4675,9 +4692,12 @@ def chunk_gated_delta_rule(
     )
 
     cache_key = (
-        problem_size,
-        q.dtype,
-        normalized_scale,
+        *make_cache_key(
+            selected_path_name,
+            _get_dtype_name(q.dtype),
+            True,
+            True,
+        ),
     )
     cache = _get_compiled_gdn_prefill_kernel(*cache_key)
 

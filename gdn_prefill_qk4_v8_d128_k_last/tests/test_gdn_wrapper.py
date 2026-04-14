@@ -21,19 +21,19 @@ def make_inputs(T=12, N=2):
     return q, k, v, g, beta, state, cu
 
 
-runtime_calls = {"launches": 0, "cache_keys": [], "compile_lookups": 0, "scales": []}
+runtime_calls = {"launches": 0, "cache_keys": [], "compile_lookups": 0, "launch_scales": []}
 compiled_cache = {}
 
 
-def fake_get_compiled(problem_size, dtype, scale):
+def fake_get_compiled(path_name, dtype_name, has_initial_state, has_output_state):
     runtime_calls["compile_lookups"] += 1
-    key = (problem_size, dtype, scale)
+    key = (path_name, dtype_name, has_initial_state, has_output_state)
     runtime_calls["cache_keys"].append(key)
-    runtime_calls["scales"].append(scale)
     if key not in compiled_cache:
 
         def fake_compiled(*args, **kwargs):
             runtime_calls["launches"] += 1
+            runtime_calls["launch_scales"].append(args[9])
 
         compiled_cache[key] = {"compiled_gdn": fake_compiled}
     return compiled_cache[key]
@@ -66,6 +66,7 @@ with (
         initial_state=state,
         cu_seqlens=cu_seqlens,
         scale=1.0,
+        path_name="small",
     )
     second_output, second_output_state = gdn.chunk_gated_delta_rule(
         q=q,
@@ -76,6 +77,7 @@ with (
         initial_state=state,
         cu_seqlens=cu_seqlens,
         scale=1.0,
+        path_name="small",
     )
     default_scale_output, default_scale_state = gdn.chunk_gated_delta_rule(
         q=q,
@@ -87,6 +89,17 @@ with (
         cu_seqlens=cu_seqlens,
         scale=None,
     )
+    large_output, large_output_state = gdn.chunk_gated_delta_rule(
+        q=q,
+        k=k,
+        v=v,
+        g=gate,
+        beta=beta,
+        initial_state=state,
+        cu_seqlens=cu_seqlens,
+        scale=1.0,
+        path_name="large",
+    )
 
 assert output.shape == v.shape
 assert output.dtype == torch.bfloat16
@@ -96,11 +109,15 @@ assert second_output.shape == v.shape
 assert second_output_state.shape == state.shape
 assert default_scale_output.shape == v.shape
 assert default_scale_state.shape == state.shape
-assert runtime_calls["launches"] == 3
+assert large_output.shape == v.shape
+assert large_output_state.shape == state.shape
+assert runtime_calls["launches"] == 4
 assert len(set(runtime_calls["cache_keys"])) == 2
 assert tolist_calls == 1
-assert runtime_calls["compile_lookups"] == 3
-assert runtime_calls["scales"][-1] == q.shape[-1] ** -0.5
+assert runtime_calls["compile_lookups"] == 4
+assert runtime_calls["cache_keys"][0][0] == "small"
+assert runtime_calls["cache_keys"][-1][0] == "large"
+assert runtime_calls["launch_scales"][2] == q.shape[-1] ** -0.5
 
 compile_lookups_before_invalid = runtime_calls["compile_lookups"]
 
@@ -158,4 +175,4 @@ else:
     raise AssertionError("Expected wrapper to reject mismatched cu_seqlens end before launch")
 assert runtime_calls["compile_lookups"] == compile_lookups_before_invalid
 
-assert runtime_calls["launches"] == 3
+assert runtime_calls["launches"] == 4

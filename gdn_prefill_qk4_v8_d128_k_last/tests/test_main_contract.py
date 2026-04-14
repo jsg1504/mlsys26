@@ -43,6 +43,7 @@ torch.testing.assert_close(calls["beta"], expected_beta)
 assert calls["initial_state"] is state
 assert calls["cu_seqlens"] is cu_seqlens
 assert calls["scale"] is None
+assert calls["path_name"] == "small"
 
 try:
     main.run(

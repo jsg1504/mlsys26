@@ -2,7 +2,7 @@
 Pack solution source files into solution.json.
 
 Reads configuration from config.toml and packs the appropriate source files
-(Triton or CUDA) into a Solution JSON file for submission.
+for the configured solution language into a Solution JSON file for submission.
 """
 
 import sys
@@ -27,7 +27,10 @@ def _get_source_dir(language: str, project_root: Path) -> Path:
         "cuda": project_root / "solution" / "cuda",
         "python": project_root / "solution" / "python",
     }
-    return mapping[language]
+    try:
+        return mapping[language]
+    except KeyError as exc:
+        raise ValueError(f"Unsupported language: {language}") from exc
 
 
 def _build_spec_from_config(build_config: dict) -> BuildSpec:

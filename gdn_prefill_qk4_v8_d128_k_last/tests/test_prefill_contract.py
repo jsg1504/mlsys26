@@ -66,3 +66,17 @@ else:
 multi_lengths = torch.tensor([0, 5, T], dtype=torch.int64)
 multi_state = torch.empty((2, 8, 128, 128), dtype=torch.float32)
 validate_inputs(q, k, v, multi_state, A_log, a, dt_bias, b, multi_lengths)
+
+try:
+    prepare_g_beta(A_log, a.float(), dt_bias, b)
+except TypeError as exc:
+    assert "a.dtype" in str(exc)
+else:
+    raise AssertionError("Expected TypeError for invalid a dtype")
+
+try:
+    prepare_g_beta(A_log, a, dt_bias, b.float())
+except TypeError as exc:
+    assert "b.dtype" in str(exc)
+else:
+    raise AssertionError("Expected TypeError for invalid b dtype")

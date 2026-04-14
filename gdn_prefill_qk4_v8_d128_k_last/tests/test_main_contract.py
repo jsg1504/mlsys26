@@ -34,3 +34,30 @@ assert new_state.shape == state.shape
 assert calls["q"].shape == (1, T, 4, 128)
 assert calls["k"].shape == (1, T, 4, 128)
 assert calls["v"].shape == (1, T, 8, 128)
+assert calls["g"].shape == (1, T, 8)
+assert calls["beta"].shape == (1, T, 8)
+expected_g = torch.full((1, T, 8), -torch.log(torch.tensor(2.0)), dtype=torch.float32)
+expected_beta = torch.full((1, T, 8), 0.5, dtype=torch.float32)
+torch.testing.assert_close(calls["g"], expected_g)
+torch.testing.assert_close(calls["beta"], expected_beta)
+assert calls["initial_state"] is state
+assert calls["cu_seqlens"] is cu_seqlens
+assert calls["scale"] == 1.0
+
+try:
+    main.run(
+        q.unsqueeze(0),
+        k.unsqueeze(0),
+        v.unsqueeze(0),
+        state,
+        A_log,
+        a,
+        dt_bias,
+        b,
+        cu_seqlens,
+        None,
+    )
+except ValueError as exc:
+    assert "flat varlen" in str(exc)
+else:
+    raise AssertionError("Expected ValueError for pseudo-batched main.run inputs")

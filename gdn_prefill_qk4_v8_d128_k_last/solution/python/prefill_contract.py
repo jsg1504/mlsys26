@@ -11,6 +11,14 @@ def prepare_g_beta(A_log, a, dt_bias, b):
         raise TypeError(f"dt_bias must be a torch.Tensor, got {type(dt_bias).__name__}")
     if not isinstance(b, torch.Tensor):
         raise TypeError(f"b must be a torch.Tensor, got {type(b).__name__}")
+    if A_log.dtype != torch.float32:
+        raise TypeError(f"A_log.dtype must be torch.float32, got {A_log.dtype}")
+    if a.dtype != torch.bfloat16:
+        raise TypeError(f"a.dtype must be torch.bfloat16, got {a.dtype}")
+    if dt_bias.dtype != torch.float32:
+        raise TypeError(f"dt_bias.dtype must be torch.float32, got {dt_bias.dtype}")
+    if b.dtype != torch.bfloat16:
+        raise TypeError(f"b.dtype must be torch.bfloat16, got {b.dtype}")
     if A_log.shape != (8,):
         raise ValueError(f"A_log.shape must be (8,), got {tuple(A_log.shape)}")
     if a.shape[1:] != (8,):

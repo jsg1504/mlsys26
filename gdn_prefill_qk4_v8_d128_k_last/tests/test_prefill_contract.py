@@ -1,4 +1,6 @@
+import gc
 import sys
+import weakref
 from pathlib import Path
 from unittest import mock
 
@@ -149,7 +151,19 @@ with mock.patch.object(torch.Tensor, "item", side_effect=AssertionError("validat
 assert tolist_calls == 1
 
 pc._CU_SEQLENS_METADATA_CACHE.clear()
+large_metadata = None
 large_cu = torch.tensor([0, 128, 256, 384, 512, 640, 768, 896, 1025], dtype=torch.int64)
+large_cu_key = id(large_cu)
+large_cu_ref = weakref.ref(large_cu)
+with mock.patch.object(torch.Tensor, "data_ptr", return_value=7):
+    large_metadata = pc.get_cu_seqlens_metadata(large_cu)
+assert large_metadata["sum_s_q"] == 1025
+assert large_cu_key in pc._CU_SEQLENS_METADATA_CACHE
+del large_cu
+gc.collect()
+assert large_cu_ref() is None
+assert large_cu_key not in pc._CU_SEQLENS_METADATA_CACHE
+
 small_cu = torch.tensor([0, 2, 4, 6, 8, 10, 12, 14, 16], dtype=torch.int64)
 small_state = torch.empty((8, 8, 128, 128), dtype=torch.float32)
 small_q = torch.empty((16, 4, 128), dtype=torch.bfloat16)
@@ -157,12 +171,9 @@ small_k = torch.empty((16, 4, 128), dtype=torch.bfloat16)
 small_v = torch.empty((16, 8, 128), dtype=torch.bfloat16)
 small_a = torch.zeros((16, 8), dtype=torch.bfloat16)
 small_b = torch.zeros((16, 8), dtype=torch.bfloat16)
-
 with mock.patch.object(torch.Tensor, "data_ptr", return_value=7):
-    large_metadata = pc.get_cu_seqlens_metadata(large_cu)
     small_metadata = pc.get_cu_seqlens_metadata(small_cu)
 
-assert large_metadata["sum_s_q"] == 1025
 assert small_metadata["sum_s_q"] == 16
 assert small_metadata["max_s_q"] == 2
 validate_inputs(small_q, small_k, small_v, small_state, A_log, small_a, dt_bias, small_b, small_cu)

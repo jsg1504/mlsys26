@@ -18,7 +18,7 @@ except ImportError:
     from gdn_blackwell import chunk_gated_delta_rule
     from gdn_blackwell.dispatch import choose_path
 
-THRESHOLD = 512
+THRESHOLD = 128
 _kernels = {}
 
 def _get_kernel_dir() -> Path:

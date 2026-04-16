@@ -4642,6 +4642,7 @@ def chunk_gated_delta_rule(
     cu_seqlens: Optional[torch.Tensor] = None,
     scale: Optional[float] = None,
     path_name: Optional[str] = None,
+    precomputed_max_s_q: Optional[int] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Compile (on first call) and run the Task 6 shell-only GDN wrapper.
 
@@ -4658,11 +4659,13 @@ def chunk_gated_delta_rule(
     Returns:
         Tuple of `(output, output_state)` for the Task 6 runtime seam only.
     """
-    # Fast path: compute metadata on GPU, skip full CPU sync
+    # Fast path: use precomputed metadata when available, skip GPU sync
     num_seqs = cu_seqlens.shape[0] - 1
     sum_s_q = q.shape[1]  # T dimension, available from tensor shape
-    # Compute max_s_q on GPU (1 sub + 1 max kernel) instead of full .cpu().tolist()
-    max_s_q = int((cu_seqlens[1:] - cu_seqlens[:-1]).max().item()) if num_seqs > 0 else 0
+    if precomputed_max_s_q is not None:
+        max_s_q = precomputed_max_s_q
+    else:
+        max_s_q = int((cu_seqlens[1:] - cu_seqlens[:-1]).max().item()) if num_seqs > 0 else 0
     selected_path_name = path_name if path_name is not None else choose_path(
         total_seq_len=sum_s_q, num_seqs=num_seqs,
     )

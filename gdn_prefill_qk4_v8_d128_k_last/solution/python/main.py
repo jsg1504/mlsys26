@@ -70,6 +70,10 @@ def run(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, scale):
         return output, new_state
 
     else:
+        # Precompute max_s_q (GPU sync) before launching gate kernel
+        max_s_q = int((cu_seqlens[1:] - cu_seqlens[:-1]).max().item()) if num_seqs > 1 else T
+
+        # Launch fused gate kernel
         gate_log = torch.empty(T, 8, dtype=torch.float32, device=q.device)
         beta = torch.empty(T, 8, dtype=torch.float32, device=q.device)
 
@@ -97,6 +101,7 @@ def run(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, scale):
             cu_seqlens=cu_seqlens,
             scale=scale,
             path_name=path_name,
+            precomputed_max_s_q=max_s_q,
         )
 
         return output.squeeze(0), new_state

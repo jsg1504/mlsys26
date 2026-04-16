@@ -4658,44 +4658,24 @@ def chunk_gated_delta_rule(
     Returns:
         Tuple of `(output, output_state)` for the Task 6 runtime seam only.
     """
-    if initial_state is None:
-        raise ValueError("Task 6 wrapper requires initial_state.")
-    if cu_seqlens is None:
-        raise ValueError("Task 6 wrapper requires cu_seqlens.")
-    metadata = _validate_task6_wrapper_inputs(q, k, v, g, beta, initial_state, cu_seqlens)
-    expected_path_name = choose_path(
-        total_seq_len=metadata["sum_s_q"],
-        num_seqs=metadata["num_seqs"],
+    # Fast path: compute metadata on GPU, skip full CPU sync
+    num_seqs = cu_seqlens.shape[0] - 1
+    sum_s_q = q.shape[1]  # T dimension, available from tensor shape
+    # Compute max_s_q on GPU (1 sub + 1 max kernel) instead of full .cpu().tolist()
+    max_s_q = int((cu_seqlens[1:] - cu_seqlens[:-1]).max().item()) if num_seqs > 0 else 0
+    selected_path_name = path_name if path_name is not None else choose_path(
+        total_seq_len=sum_s_q, num_seqs=num_seqs,
     )
-    selected_path_name = expected_path_name if path_name is None else path_name
-    if selected_path_name not in VALID_PATH_NAMES:
-        raise ValueError(f"Unsupported path_name: {selected_path_name}")
-    if selected_path_name != expected_path_name:
-        raise ValueError(
-            f"path_name must match dispatch policy for this workload: "
-            f"expected {expected_path_name!r}, got {selected_path_name!r}"
-        )
     normalized_scale = q.shape[-1] ** -0.5 if scale is None else scale
 
-    # Allocate output if needed
     output = torch.empty_like(v)
 
-    # Check if supported
-    if not GDN.can_implement(
-        tuple(q.shape),
-        tuple(v.shape),
-        q.dtype,
-        output.dtype,
-        beta.dtype,
-        False,
-    ):
-        raise ValueError("Unsupported input shape or dtype")
     problem_size = _get_problem_size(
         tuple(q.shape),
         tuple(v.shape),
-        metadata["num_seqs"],
-        metadata["max_s_q"],
-        metadata["sum_s_q"],
+        num_seqs,
+        max_s_q,
+        sum_s_q,
     )
 
     output_state = torch.empty(

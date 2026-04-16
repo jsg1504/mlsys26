@@ -26,7 +26,7 @@ QUICK_WORKLOAD_LIMIT = 3
 
 image = (
     modal.Image.from_registry(
-        "nvidia/cuda:12.8.1-devel-ubuntu22.04",
+        "nvidia/cuda:13.2.0-devel-ubuntu22.04",
         add_python="3.12",
     )
     .pip_install(
@@ -45,14 +45,6 @@ def run_benchmark(solution: Solution, config: BenchmarkConfig = None, workload_l
     """Run benchmark on Modal B200 and return results."""
     if config is None:
         config = BenchmarkConfig(warmup_runs=1, iterations=3, num_trials=1)
-
-    if workload_limit is None and (
-        config.warmup_runs == 1
-        and config.iterations == 3
-        and config.num_trials == 1
-        and config.timeout_seconds == QUICK_BENCHMARK_TIMEOUT_SECONDS
-    ):
-        workload_limit = QUICK_WORKLOAD_LIMIT
 
     configure_logging(level=logging.INFO)
 
@@ -156,12 +148,13 @@ def print_results(results: dict):
 
 
 @app.local_entrypoint()
-def main(subfolder: str, quick: bool = True):
+def main(subfolder: str, quick: bool = True, limit: int = 0):
     """Load pre-packed solution.json from subfolder and run benchmark on Modal.
 
     Args:
         subfolder: Which subfolder to benchmark (e.g. gdn_decode_qk4_v8_d128_k_last)
         quick: Use fast config for development (default). Pass --no-quick for final submission.
+        limit: Max number of workloads to run. 0 means all workloads (default).
     """
     import scripts.pack_solution as ps
 
@@ -176,7 +169,7 @@ def main(subfolder: str, quick: bool = True):
 
     config = build_benchmark_config(quick)
     mode = "quick" if quick else "full"
-    workload_limit = QUICK_WORKLOAD_LIMIT if quick else None
+    workload_limit = limit if limit > 0 else None
     workload_note = f", {workload_limit} workloads max" if workload_limit is not None else ""
     print_phase(
         f"Submitting benchmark to Modal B200 ({mode} mode, timeout {config.timeout_seconds}s{workload_note})..."

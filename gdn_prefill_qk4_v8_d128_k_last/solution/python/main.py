@@ -1,78 +1,36 @@
 import torch
+import torch.nn.functional as F
 
 try:
     from .gdn_blackwell import chunk_gated_delta_rule
     from .gdn_blackwell.dispatch import choose_path
-    from .prefill_contract import get_cu_seqlens_metadata, prepare_g_beta, validate_inputs
 except ImportError:
     from gdn_blackwell import chunk_gated_delta_rule
     from gdn_blackwell.dispatch import choose_path
-    from prefill_contract import get_cu_seqlens_metadata, prepare_g_beta, validate_inputs
-
-
-def _prepare_runtime_inputs(q, k, v, g, beta):
-    if q.ndim != 3 or k.ndim != 3 or v.ndim != 3:
-        raise ValueError("main.run currently accepts only flat varlen inputs for q, k, and v.")
-    return {
-        "q": q.unsqueeze(0),
-        "k": k.unsqueeze(0),
-        "v": v.unsqueeze(0),
-        "g": g.unsqueeze(0),
-        "beta": beta.unsqueeze(0),
-    }
 
 
 def run(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, scale):
-    if isinstance(q, torch.Tensor) and isinstance(k, torch.Tensor) and isinstance(v, torch.Tensor):
-        if q.ndim != 3 or k.ndim != 3 or v.ndim != 3:
-            raise ValueError("main.run currently accepts only flat varlen inputs for q, k, and v.")
-    validate_inputs(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens)
-    cu_metadata = get_cu_seqlens_metadata(cu_seqlens)
-    gate_log, beta = prepare_g_beta(A_log, a, dt_bias, b)
-    runtime_inputs = _prepare_runtime_inputs(q, k, v, gate_log, beta)
-    path_name = choose_path(
-        total_seq_len=cu_metadata["sum_s_q"],
-        num_seqs=cu_metadata["num_seqs"],
-    )
+    # Gate computation — minimal kernel launches
+    # a: [T, 8] bf16, dt_bias: [8] f32, A_log: [8] f32, b: [T, 8] bf16
+    gate_log = -(A_log.exp() * F.softplus(a.float() + dt_bias))
+    beta = b.float().sigmoid_()
+
+    # cu_seqlens metadata — avoid full CPU sync
+    num_seqs = cu_seqlens.shape[0] - 1
+    sum_s_q = q.shape[0]
+
+    path_name = choose_path(total_seq_len=sum_s_q, num_seqs=num_seqs)
 
     output, new_state = chunk_gated_delta_rule(
-        **runtime_inputs,
+        q=q.unsqueeze(0),
+        k=k.unsqueeze(0),
+        v=v.unsqueeze(0),
+        g=gate_log.unsqueeze(0),
+        beta=beta.unsqueeze(0),
         initial_state=state,
         cu_seqlens=cu_seqlens,
         scale=scale,
         path_name=path_name,
     )
-
-    expected_output_shape = runtime_inputs["v"].shape
-    if not isinstance(output, torch.Tensor):
-        raise TypeError(f"chunk_gated_delta_rule output must be a torch.Tensor, got {type(output).__name__}")
-    if output.shape != expected_output_shape:
-        raise ValueError(
-            f"chunk_gated_delta_rule output.shape must be {tuple(expected_output_shape)}, got {tuple(output.shape)}"
-        )
-    if output.dtype != runtime_inputs["v"].dtype:
-        raise ValueError(
-            f"chunk_gated_delta_rule output.dtype must be {runtime_inputs['v'].dtype}, got {output.dtype}"
-        )
-    if output.device != runtime_inputs["v"].device:
-        raise ValueError(
-            f"chunk_gated_delta_rule output.device must be {runtime_inputs['v'].device}, got {output.device}"
-        )
-    if not isinstance(new_state, torch.Tensor):
-        raise TypeError(
-            f"chunk_gated_delta_rule new_state must be a torch.Tensor, got {type(new_state).__name__}"
-        )
-    if new_state.shape != state.shape:
-        raise ValueError(
-            f"chunk_gated_delta_rule new_state.shape must be {tuple(state.shape)}, got {tuple(new_state.shape)}"
-        )
-    if new_state.dtype != state.dtype:
-        raise ValueError(
-            f"chunk_gated_delta_rule new_state.dtype must be {state.dtype}, got {new_state.dtype}"
-        )
-    if new_state.device != state.device:
-        raise ValueError(
-            f"chunk_gated_delta_rule new_state.device must be {state.device}, got {new_state.device}"
-        )
 
     return output.squeeze(0), new_state

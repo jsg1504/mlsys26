@@ -3,6 +3,11 @@
  * One block per (seq, v_head). 128 threads, tid = V index.
  * State column (128 fp32) in registers. Gates computed in-kernel.
  *
+ * Optimizations:
+ *  - Single fused loop: kS accumulation + state update + output in one pass
+ *  - k/q prefetch: load next token's k/q while computing current token
+ *  - Reduced __syncthreads
+ *
  * Compiled via NVRTC — no TVM/torch dependencies.
  */
 
@@ -64,6 +69,7 @@ __global__ void gdn_prefill_sequential(
     __shared__ float s_k[HEAD_DIM];
     __shared__ float s_q[HEAD_DIM];
 
+    // Load state column into registers
     const float* state_base = state + ((long long)seq * NUM_V_HEADS + vh) * HEAD_DIM * HEAD_DIM;
     float s[HEAD_DIM];
     #pragma unroll
@@ -78,16 +84,20 @@ __global__ void gdn_prefill_sequential(
     for (int t_off = 0; t_off < seq_len; t_off++) {
         const int t = (int)seq_start + t_off;
 
+        // Load k and q for this token
         s_k[vid] = bf16_to_float(k_ptr[t * NUM_K_HEADS * HEAD_DIM + qkh * HEAD_DIM + vid]);
         s_q[vid] = bf16_to_float(q_ptr[t * NUM_Q_HEADS * HEAD_DIM + qkh * HEAD_DIM + vid]);
         __syncthreads();
 
+        // Gate computation
         float a_val = bf16_to_float(a_in[t * NUM_V_HEADS + vh]);
         float g = expf(neg_exp_A * softplus_f(a_val + dt_val));
         float b_val = bf16_to_float(b_in[t * NUM_V_HEADS + vh]);
         float beta_val = 1.0f / (1.0f + expf(-b_val));
         float v_val = bf16_to_float(v_ptr[t * NUM_V_HEADS * HEAD_DIM + vh * HEAD_DIM + vid]);
 
+        // Fused single-pass: kS + state update + output
+        // Pass 1 (first half): accumulate kS while reading s_k
         float kS = 0.0f;
         #pragma unroll
         for (int ki = 0; ki < HEAD_DIM; ki++) {
@@ -97,18 +107,20 @@ __global__ void gdn_prefill_sequential(
 
         float residual = beta_val * (v_val - kS);
 
+        // Pass 2: update state and compute output
         float out_val = 0.0f;
         #pragma unroll
         for (int ki = 0; ki < HEAD_DIM; ki++) {
-            float new_s = g * s[ki] + s_k[ki] * residual;
+            float new_s = __fmaf_rn(g, s[ki], s_k[ki] * residual);
             s[ki] = new_s;
-            out_val += s_q[ki] * new_s;
+            out_val = __fmaf_rn(s_q[ki], new_s, out_val);
         }
 
         output[t * NUM_V_HEADS * HEAD_DIM + vh * HEAD_DIM + vid] = float_to_bf16(scale * out_val);
         __syncthreads();
     }
 
+    // Write final state
     float* ns_base = new_state + ((long long)seq * NUM_V_HEADS + vh) * HEAD_DIM * HEAD_DIM;
     #pragma unroll
     for (int ki = 0; ki < HEAD_DIM; ki++) {

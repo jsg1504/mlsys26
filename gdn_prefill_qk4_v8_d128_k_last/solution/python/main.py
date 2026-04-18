@@ -18,7 +18,7 @@ except ImportError:
     from gdn_blackwell import chunk_gated_delta_rule, get_gdn_bundle
     from prefill_contract import get_cu_seqlens_metadata
 
-THRESHOLD = 64
+THRESHOLD = 128
 _DEFAULT_SCALE = 128 ** -0.5
 _kernels = {}
 _cached_stream = None

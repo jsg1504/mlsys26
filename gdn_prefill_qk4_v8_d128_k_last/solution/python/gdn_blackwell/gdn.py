@@ -4439,6 +4439,38 @@ def _get_compiled_gdn_prefill_kernel(path_name: str):
     return {"compiled_by_signature": {}}
 
 
+_cached_stream = None
+_output_cache = {}
+_state_cache = {}
+
+
+def _get_stream():
+    global _cached_stream
+    if _cached_stream is None:
+        _cached_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    return _cached_stream
+
+
+def _get_output(shape, dtype, device):
+    key = (shape, dtype, device)
+    cached = _output_cache.get(key)
+    if cached is not None:
+        return cached
+    t = torch.empty(shape, dtype=dtype, device=device)
+    _output_cache[key] = t
+    return t
+
+
+def _get_state(shape, device):
+    key = (shape, device)
+    cached = _state_cache.get(key)
+    if cached is not None:
+        return cached
+    t = torch.empty(shape, dtype=torch.float32, device=device)
+    _state_cache[key] = t
+    return t
+
+
 def chunk_gated_delta_rule(
     *,
     q: torch.Tensor,
@@ -4452,34 +4484,18 @@ def chunk_gated_delta_rule(
     path_name: Optional[str] = None,
     precomputed_max_s_q: Optional[int] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Compile (on first call) and run the Task 6 shell-only GDN wrapper.
-
-    Args:
-        q, k: (1, T, H_qk, D) query and key tensors from the current shell.
-        v:     (1, T, H_v, D) value tensor from the current shell.
-        g:     (1, T, H_v) gate values (f32, log-space).
-        beta:  (1, T, H_v) beta values (f32, sigmoid-space).
-        initial_state: Required recurrent state input with shape (N, H_v, D, D).
-        cu_seqlens: Required cumulative sequence lengths for the flat-varlen batch.
-        scale: Scale factor for the attention scores. Defaults to 1/sqrt(D).
-        path_name: Optional dispatch family name for the Task 6 seam.
-
-    Returns:
-        Tuple of `(output, output_state)` for the Task 6 runtime seam only.
-    """
-    # Fast path: use precomputed metadata when available, skip GPU sync
+    """Compile (on first call) and run the Task 6 shell-only GDN wrapper."""
     num_seqs = cu_seqlens.shape[0] - 1
-    sum_s_q = q.shape[1]  # T dimension, available from tensor shape
-    if precomputed_max_s_q is not None:
-        max_s_q = precomputed_max_s_q
-    else:
-        max_s_q = int((cu_seqlens[1:] - cu_seqlens[:-1]).max().item()) if num_seqs > 0 else 0
+    sum_s_q = q.shape[1]
+    max_s_q = precomputed_max_s_q if precomputed_max_s_q is not None else (
+        int((cu_seqlens[1:] - cu_seqlens[:-1]).max().item()) if num_seqs > 0 else 0
+    )
     selected_path_name = path_name if path_name is not None else (
         "small" if sum_s_q <= 1024 and num_seqs <= 8 else "large"
     )
     normalized_scale = q.shape[-1] ** -0.5 if scale is None else scale
 
-    output = torch.empty_like(v)
+    output = _get_output(tuple(v.shape), v.dtype, v.device)
 
     problem_size = _get_problem_size(
         tuple(q.shape),
@@ -4489,17 +4505,15 @@ def chunk_gated_delta_rule(
         sum_s_q,
     )
 
-    output_state = torch.empty(
+    output_state = _get_state(
         (problem_size[0], problem_size[4], problem_size[5], problem_size[5]),
-        dtype=torch.float32,
-        device=q.device,
+        q.device,
     )
 
-    family_cache = _get_compiled_gdn_prefill_kernel(selected_path_name)
-    compiled_cache = family_cache["compiled_by_signature"]
+    compiled_cache = _get_compiled_gdn_prefill_kernel(selected_path_name)["compiled_by_signature"]
     compiled_key = (problem_size, float(normalized_scale))
 
-    current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    current_stream = _get_stream()
 
     if compiled_key not in compiled_cache:
         # GDN kernel

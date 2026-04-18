@@ -12,12 +12,22 @@ import cuda.bindings.driver as drv
 try:
     from .nvrtc_loader import compile_and_load, launch
     from .gdn_blackwell import chunk_gated_delta_rule
+    from .prefill_contract import get_cu_seqlens_metadata
 except ImportError:
     from nvrtc_loader import compile_and_load, launch
     from gdn_blackwell import chunk_gated_delta_rule
+    from prefill_contract import get_cu_seqlens_metadata
 
 THRESHOLD = 128
+_DEFAULT_SCALE = 128 ** -0.5
 _kernels = {}
+_cached_stream = None
+_gate_cache = {}
+
+# Pre-created ctypes constants
+_INT32_8 = ctypes.c_int32(8)
+_BLOCK_128 = (128, 1, 1)
+_BLOCK_256 = (256, 1, 1)
 
 def _get_kernel_dir() -> Path:
     return Path(__file__).parent / "nvrtc_kernels"
@@ -40,25 +50,44 @@ def _ptr(t: torch.Tensor):
     return ctypes.c_uint64(t.data_ptr())
 
 
+def _get_stream():
+    global _cached_stream
+    if _cached_stream is None:
+        _cached_stream = drv.CUstream(torch.cuda.current_stream().cuda_stream)
+    return _cached_stream
+
+
+def _get_gate_tensors(T, device):
+    key = (T, device)
+    cached = _gate_cache.get(key)
+    if cached is not None:
+        return cached
+    tensors = (
+        torch.empty(T, 8, dtype=torch.float32, device=device),
+        torch.empty(T, 8, dtype=torch.float32, device=device),
+    )
+    _gate_cache[key] = tensors
+    return tensors
+
+
 def run(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, scale):
     _ensure_kernels()
 
     T = q.shape[0]
     num_seqs = cu_seqlens.shape[0] - 1
-    stream = drv.CUstream(torch.cuda.current_stream().cuda_stream)
+    stream = _get_stream()
 
     if scale is None or scale == 0.0:
-        scale = 128 ** -0.5
+        scale = _DEFAULT_SCALE
 
     if T <= THRESHOLD:
         output = torch.empty(T, 8, 128, dtype=torch.bfloat16, device=q.device)
         new_state = torch.empty_like(state)
 
         grid = (num_seqs * 8, 1, 1)
-        block = (128, 1, 1)
 
         launch(
-            _kernels["sequential"], grid, block,
+            _kernels["sequential"], grid, _BLOCK_128,
             [_ptr(q), _ptr(k), _ptr(v), _ptr(state),
              _ptr(A_log), _ptr(a), _ptr(dt_bias), _ptr(b),
              _ptr(cu_seqlens), ctypes.c_float(scale),
@@ -68,22 +97,21 @@ def run(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, scale):
         return output, new_state
 
     else:
-        # Precompute max_s_q (GPU sync) before launching gate kernel
-        max_s_q = int((cu_seqlens[1:] - cu_seqlens[:-1]).max().item()) if num_seqs > 1 else T
+        # Use cached metadata (no GPU sync on cache hit)
+        meta = get_cu_seqlens_metadata(cu_seqlens)
+        max_s_q = meta["max_s_q"]
 
-        # Launch fused gate kernel
-        gate_log = torch.empty(T, 8, dtype=torch.float32, device=q.device)
-        beta = torch.empty(T, 8, dtype=torch.float32, device=q.device)
+        # Reuse pre-allocated gate tensors
+        gate_log, beta = _get_gate_tensors(T, q.device)
 
         total_elems = T * 8
-        threads = 256
-        blocks_gate = (total_elems + threads - 1) // threads
+        blocks_gate = (total_elems + 255) // 256
 
         launch(
-            _kernels["fused_gate"], (blocks_gate, 1, 1), (threads, 1, 1),
+            _kernels["fused_gate"], (blocks_gate, 1, 1), _BLOCK_256,
             [_ptr(A_log), _ptr(a), _ptr(dt_bias), _ptr(b),
              _ptr(gate_log), _ptr(beta),
-             ctypes.c_int32(T), ctypes.c_int32(8)],
+             ctypes.c_int32(T), _INT32_8],
             shared_mem=0, stream=stream,
         )
 

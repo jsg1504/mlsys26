@@ -45,17 +45,14 @@ from cutlass._mlir.dialects import nvvm
 import cuda.bindings.driver as cuda
 
 try:
-    from .dispatch import VALID_PATH_NAMES, choose_path, make_cache_key
     from ..prefill_contract import get_cu_seqlens_metadata
 except ImportError:
-    from gdn_blackwell.dispatch import VALID_PATH_NAMES, choose_path, make_cache_key
     from prefill_contract import get_cu_seqlens_metadata
 
 from .gdn_tile_scheduler import *
 from .gdn_helpers import *
 
 import functools
-import warnings
 
 from cutlass.cute import EnableTVMFFI
 
@@ -180,91 +177,6 @@ class GDN:
         self.invert_mma_tiler = (128, 128, 64)
         self.invert_sub_stage = 1
         self.sub_stage = 9
-
-    @staticmethod
-    def can_implement(
-        q_shape: Tuple[int, int, int, int] | Tuple[int, Tuple[int, ...], int, int],
-        v_shape: Tuple[int, int, int, int] | Tuple[int, Tuple[int, ...], int, int],
-        in_dtype: Type[cutlass.Numeric],
-        out_dtype: Type[cutlass.Numeric],
-        g_beta_dtype: Type[cutlass.Numeric],
-        use_qk_l2norm_in_kernel: bool = False,
-    ) -> bool:
-        """
-        Check if the gdn can be implemented
-        """
-
-        can_implement = True
-
-        # Unpack parameters
-        b, s_q, h_q, d = q_shape
-        b_, _, h_v, d_ = v_shape
-
-        if use_qk_l2norm_in_kernel:
-            warnings.warn("use_qk_l2norm_in_kernel is not supported yet", stacklevel=2)
-            can_implement = False
-
-        if b != b_:
-            warnings.warn("q & v must have the same batch size", stacklevel=2)
-            can_implement = False
-
-        if b != 1:
-            warnings.warn("Task 5 runtime only supports batch size 1", stacklevel=2)
-            can_implement = False
-
-        if d != d_:
-            warnings.warn("q & k must have the same head dimension", stacklevel=2)
-            can_implement = False
-
-        # todo: maybe support more later.
-        if d not in {128}:
-            warnings.warn("head dimension must be 128", stacklevel=2)
-            can_implement = False
-
-        if h_q != 4:
-            warnings.warn("Task 5 runtime requires q/k head count 4", stacklevel=2)
-            can_implement = False
-
-        if h_v != 8:
-            warnings.warn("Task 5 runtime requires v head count 8", stacklevel=2)
-            can_implement = False
-
-        if isinstance(s_q, tuple) and len(s_q) != b:
-            warnings.warn(
-                "variable_seqlen s_q must have the length of batch size", stacklevel=2
-            )
-            can_implement = False
-
-        if in_dtype not in {
-            cutlass.BFloat16,
-            torch.bfloat16,
-        }:
-            warnings.warn(
-                "Task 5 runtime requires bfloat16 q/k/v inputs",
-                stacklevel=2,
-            )
-            can_implement = False
-
-        if out_dtype not in {
-            cutlass.BFloat16,
-            torch.bfloat16,
-        }:
-            warnings.warn(
-                "Task 5 runtime requires bfloat16 outputs",
-                stacklevel=2,
-            )
-            can_implement = False
-
-        if g_beta_dtype not in {cutlass.Float32, torch.float32}:
-            warnings.warn(
-                "g_beta_dtype must be Float32 or torch.float32, but got {}".format(
-                    g_beta_dtype
-                ),
-                stacklevel=2,
-            )
-            can_implement = False
-
-        return can_implement
 
     @cute.kernel
     def kernel(
@@ -4522,113 +4434,9 @@ def _get_problem_size(q_shape, v_shape, num_seqs, max_s_q, sum_s_q):
 
 
 @functools.cache
-def _get_compiled_gdn_prefill_kernel(
-    path_name: str,
-    dtype_name: str,
-    has_initial_state: bool,
-    has_output_state: bool,
-):
+def _get_compiled_gdn_prefill_kernel(path_name: str):
     """Return the outer family cache bucket for the Task 6 seam."""
     return {"compiled_by_signature": {}}
-
-
-def _get_dtype_name(dtype: torch.dtype) -> str:
-    if dtype == torch.bfloat16:
-        return "bf16"
-    return str(dtype)
-
-
-def _make_compiled_artifact_key(problem_size, normalized_scale):
-    return (problem_size, float(normalized_scale))
-
-
-def _validate_task6_wrapper_inputs(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    g: torch.Tensor,
-    beta: torch.Tensor,
-    initial_state: torch.Tensor,
-    cu_seqlens: torch.Tensor,
-):
-    for name, tensor in (
-        ("q", q),
-        ("k", k),
-        ("v", v),
-        ("g", g),
-        ("beta", beta),
-        ("initial_state", initial_state),
-        ("cu_seqlens", cu_seqlens),
-    ):
-        if not isinstance(tensor, torch.Tensor):
-            raise TypeError(f"{name} must be a torch.Tensor, got {type(tensor).__name__}")
-
-    reference_device = q.device
-    for name, tensor in (
-        ("k", k),
-        ("v", v),
-        ("g", g),
-        ("beta", beta),
-        ("initial_state", initial_state),
-        ("cu_seqlens", cu_seqlens),
-    ):
-        if tensor.device != reference_device:
-            raise ValueError(f"{name}.device must match q.device, got {tensor.device} and {reference_device}")
-
-    if q.dtype != torch.bfloat16:
-        raise TypeError(f"q.dtype must be torch.bfloat16, got {q.dtype}")
-    if k.dtype != torch.bfloat16:
-        raise TypeError(f"k.dtype must be torch.bfloat16, got {k.dtype}")
-    if v.dtype != torch.bfloat16:
-        raise TypeError(f"v.dtype must be torch.bfloat16, got {v.dtype}")
-    if g.dtype != torch.float32:
-        raise TypeError(f"g.dtype must be torch.float32, got {g.dtype}")
-    if beta.dtype != torch.float32:
-        raise TypeError(f"beta.dtype must be torch.float32, got {beta.dtype}")
-    if initial_state.dtype != torch.float32:
-        raise TypeError(f"initial_state.dtype must be torch.float32, got {initial_state.dtype}")
-    if cu_seqlens.dtype != torch.int64:
-        raise TypeError(f"cu_seqlens.dtype must be torch.int64, got {cu_seqlens.dtype}")
-
-    if q.ndim != 4 or tuple(q.shape[0:1] + q.shape[2:4]) != (1, 4, 128):
-        raise ValueError(f"q.shape must be (1, T, 4, 128), got {tuple(q.shape)}")
-    if k.ndim != 4 or tuple(k.shape[0:1] + k.shape[2:4]) != (1, 4, 128):
-        raise ValueError(f"k.shape must be (1, T, 4, 128), got {tuple(k.shape)}")
-    if v.ndim != 4 or tuple(v.shape[0:1] + v.shape[2:4]) != (1, 8, 128):
-        raise ValueError(f"v.shape must be (1, T, 8, 128), got {tuple(v.shape)}")
-
-    T = q.shape[1]
-    if k.shape[1] != T:
-        raise ValueError(f"k.shape[1] must match q.shape[1], got {k.shape[1]} and {T}")
-    if v.shape[1] != T:
-        raise ValueError(f"v.shape[1] must match q.shape[1], got {v.shape[1]} and {T}")
-    if g.shape != (1, T, 8):
-        raise ValueError(f"g.shape must be (1, T, 8), got {tuple(g.shape)}")
-    if beta.shape != (1, T, 8):
-        raise ValueError(f"beta.shape must be (1, T, 8), got {tuple(beta.shape)}")
-    if initial_state.ndim != 4 or tuple(initial_state.shape[1:]) != (8, 128, 128):
-        raise ValueError(
-            f"initial_state.shape must be (N, 8, 128, 128), got {tuple(initial_state.shape)}"
-        )
-    if cu_seqlens.ndim != 1:
-        raise ValueError(f"cu_seqlens must be 1D, got {cu_seqlens.ndim}D")
-
-    metadata = get_cu_seqlens_metadata(cu_seqlens)
-    if metadata["num_seqs"] < 1:
-        raise ValueError("cu_seqlens must describe at least one sequence.")
-    if metadata["first"] != 0:
-        raise ValueError(f"cu_seqlens must start at 0, got {metadata['first']}")
-    if metadata["last"] != T:
-        raise ValueError(f"cu_seqlens must end at T={T}, got {metadata['last']}")
-    if not metadata["nondecreasing"]:
-        raise ValueError("cu_seqlens must be nondecreasing.")
-    if initial_state.shape[0] != metadata["num_seqs"]:
-        raise ValueError(
-            "initial_state.shape[0] must match len(cu_seqlens) - 1, "
-            f"got {initial_state.shape[0]} and {metadata['num_seqs']}"
-        )
-
-    return metadata
 
 
 def chunk_gated_delta_rule(
@@ -4666,8 +4474,8 @@ def chunk_gated_delta_rule(
         max_s_q = precomputed_max_s_q
     else:
         max_s_q = int((cu_seqlens[1:] - cu_seqlens[:-1]).max().item()) if num_seqs > 0 else 0
-    selected_path_name = path_name if path_name is not None else choose_path(
-        total_seq_len=sum_s_q, num_seqs=num_seqs,
+    selected_path_name = path_name if path_name is not None else (
+        "small" if sum_s_q <= 1024 and num_seqs <= 8 else "large"
     )
     normalized_scale = q.shape[-1] ** -0.5 if scale is None else scale
 
@@ -4687,15 +4495,9 @@ def chunk_gated_delta_rule(
         device=q.device,
     )
 
-    family_cache_key = make_cache_key(
-        selected_path_name,
-        _get_dtype_name(q.dtype),
-        True,
-        True,
-    )
-    family_cache = _get_compiled_gdn_prefill_kernel(*family_cache_key)
+    family_cache = _get_compiled_gdn_prefill_kernel(selected_path_name)
     compiled_cache = family_cache["compiled_by_signature"]
-    compiled_key = _make_compiled_artifact_key(problem_size, normalized_scale)
+    compiled_key = (problem_size, float(normalized_scale))
 
     current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 

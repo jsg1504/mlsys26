@@ -12,11 +12,9 @@ import cuda.bindings.driver as drv
 try:
     from .nvrtc_loader import compile_and_load, launch
     from .gdn_blackwell import chunk_gated_delta_rule
-    from .gdn_blackwell.dispatch import choose_path
 except ImportError:
     from nvrtc_loader import compile_and_load, launch
     from gdn_blackwell import chunk_gated_delta_rule
-    from gdn_blackwell.dispatch import choose_path
 
 THRESHOLD = 128
 _kernels = {}
@@ -89,7 +87,7 @@ def run(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, scale):
             shared_mem=0, stream=stream,
         )
 
-        path_name = choose_path(total_seq_len=T, num_seqs=num_seqs)
+        path_name = "small" if T <= 1024 and num_seqs <= 8 else "large"
 
         output, new_state = chunk_gated_delta_rule(
             q=q.unsqueeze(0),

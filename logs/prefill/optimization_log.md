@@ -24,7 +24,31 @@ Tracking all optimization iterations for the prefill kernel.
 - Correctness envelope on this run: max abs error `9.09e-03`, max rel error `3.29e+03`.
 - This full run still uses the same dispatch split: `small` when `total_seq_len <= 1024` and `num_seqs <= 8`, otherwise `large`.
 
-## 2026-04-18 - Full Python-dispatch optimization pass (ACCEPTED, cumulative)
+## 2026-04-18 (session 2) - Deep Python dispatch + fast-launch (ACCEPTED, cumulative)
+
+Second optimization pass targeting all remaining Python-side overhead.
+
+| Step | Change | Mean (ms) | Δ vs prior | Δ vs baseline |
+|---|---|---|---|---|
+| starting | After session 1 (4D views cached) | 0.2629 | — | -6.8% |
+| 1 | Fast-launch: _SeqArgs/_GateArgs pre-allocated ctypes + direct drv.cuLaunchKernel | 0.2365 | -10.0% | -16.1% |
+| 2 | get_gdn_bundle fast-path: cached (compiled_gdn, output, output_state) tuple | 0.2347 | -0.8% | -16.8% |
+| 3 | Skip unsqueeze at call site (data_ptr identical for 3D and 4D view) | 0.2277 | -3.0% | -19.3% |
+| 4 | Cache output.squeeze(0) in bundle | 0.2287 | noise | -18.9% |
+| 5 | Cache data_ptr() for stable gate_log/beta/output/output_state tensors | **0.2265** | -1.0% | **-19.7%** |
+
+- **Final result**: 0.282ms → **0.2265ms (-19.7%)**
+- **Status**: accepted (100% correctness preserved)
+- **Target**: 0.2ms (still 13% away)
+- **Key techniques**:
+  1. **Pre-allocated ctypes + direct cuLaunchKernel**: Biggest win. The generic `launch()` helper was creating ctypes objects per call; a pre-allocated struct of ctypes slots with a pre-built `c_void_p` array eliminates this. Saves ~27us per NVRTC kernel launch.
+  2. **Bundle cache**: Cache `(compiled_gdn, output, output_state, problem_size, scale, output_3d, output_ptr, output_state_ptr)` keyed by (problem_size, scale, path_name). Skips the chunk_gated_delta_rule wrapper on cache hits.
+  3. **Skip redundant view operations**: `.unsqueeze(0)` and `.squeeze(0)` are cheap but non-free. The kernel was compiled against 4D iterators but only uses data_ptr at launch — so 3D tensors work identically.
+  4. **data_ptr caching**: For tensors that live in shape-keyed caches (never freed), cache their device pointer once.
+
+- **Why sub-0.2ms wasn't reached**: The 17 CuTe-DSL long-path workloads contribute ~13ms out of 22.6ms total. Mean of fast workloads is already 0.115ms. Reaching 0.2ms requires cutting CuTe-DSL time by ~40%, which needs GPU-kernel modifications (chunk-level parallelism via WY decomposition + cooperative scheduling) in the 4500-line vendored kernel.
+
+## 2026-04-18 (session 1) - Initial Python-dispatch optimization pass (ACCEPTED, cumulative; superseded by session 2)
 
 Iterative optimizations to eliminate Python-side overhead, guided by the insight that CUDA event timing wraps the entire `run()` call (every microsecond of dispatch appears as GPU idle time).
 

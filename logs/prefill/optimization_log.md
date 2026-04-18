@@ -23,3 +23,14 @@ Tracking all optimization iterations for the prefill kernel.
 - Full-workload metrics: mean latency `0.3426 ms`, mean speedup `488.44x`, min/max latency `0.1924 / 1.0576 ms`, min/max speedup `6.50x / 2149.36x`.
 - Correctness envelope on this run: max abs error `9.09e-03`, max rel error `3.29e+03`.
 - This full run still uses the same dispatch split: `small` when `total_seq_len <= 1024` and `num_seqs <= 8`, otherwise `large`.
+
+## 2026-04-18 - Double-buffered sequential kernel (REVERTED)
+
+- **Idea**: Reduce per-token sync in NVRTC sequential kernel via double-buffered k/q shared memory + scalar (v/a/b) prefetch. Cut from 2 syncs/token to 1, overlap next-token load with current compute.
+- **Result**: 0.282ms → 0.296ms (+4.9% regression)
+- **Status**: reverted
+- **Why it didn't work**: The sequential kernel only handles T≤128 workloads (already fast, 0.05-0.15ms each). The added complexity (preload phase, buffer indexing, conditional sync) added overhead that dominates savings for very short sequences (T=6-32). Meanwhile, the 18 workloads >0.5ms (all in CuTe-DSL path) remain the bottleneck — they contribute ~60% of total time and were unaffected by this change.
+- **Learning**: To hit sub-0.2ms, optimization must target the long-sequence CuTe-DSL path (>0.5ms workloads), not the already-fast sequential path. Possible directions:
+  1. Hand-written CUDA chunked kernel replacing CuTe-DSL for medium sequences (T=128-2048)
+  2. Eliminate Python/GPU-sync overhead in the long-path dispatch
+  3. Investigate whether the CuTe-DSL kernel has tunable parameters (chunk_size, tile sizes) that benefit our specific problem shape

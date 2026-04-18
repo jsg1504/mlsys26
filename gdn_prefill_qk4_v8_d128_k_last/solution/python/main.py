@@ -64,10 +64,10 @@ def _get_gate_tensors(T, device):
     cached = _gate_cache.get(key)
     if cached is not None:
         return cached
-    tensors = (
-        torch.empty(T, 8, dtype=torch.float32, device=device),
-        torch.empty(T, 8, dtype=torch.float32, device=device),
-    )
+    gate_log = torch.empty(T, 8, dtype=torch.float32, device=device)
+    beta = torch.empty(T, 8, dtype=torch.float32, device=device)
+    # Pre-compute 4D views to avoid .unsqueeze(0) per call
+    tensors = (gate_log, beta, gate_log.unsqueeze(0), beta.unsqueeze(0))
     _gate_cache[key] = tensors
     return tensors
 
@@ -123,11 +123,10 @@ def run(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, scale):
         meta = get_cu_seqlens_metadata(cu_seqlens)
         max_s_q = meta["max_s_q"]
 
-        # Reuse pre-allocated gate tensors
-        gate_log, beta = _get_gate_tensors(T, q.device)
+        # Reuse pre-allocated gate tensors (4D views pre-computed)
+        gate_log, beta, gate_log_4d, beta_4d = _get_gate_tensors(T, q.device)
 
-        total_elems = T * 8
-        blocks_gate = (total_elems + 255) // 256
+        blocks_gate = (T * 8 + 255) // 256
 
         launch(
             _kernels["fused_gate"], (blocks_gate, 1, 1), _BLOCK_256,
@@ -143,8 +142,8 @@ def run(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, scale):
             q=q.unsqueeze(0),
             k=k.unsqueeze(0),
             v=v.unsqueeze(0),
-            g=gate_log.unsqueeze(0),
-            beta=beta.unsqueeze(0),
+            g=gate_log_4d,
+            beta=beta_4d,
             initial_state=state,
             cu_seqlens=cu_seqlens,
             scale=scale,

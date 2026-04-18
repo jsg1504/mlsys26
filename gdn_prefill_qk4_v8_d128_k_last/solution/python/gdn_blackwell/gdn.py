@@ -4490,11 +4490,16 @@ def get_gdn_bundle(
 ):
     """Fast-path entry: returns (compiled_gdn, output, output_state) for direct invocation.
 
-    main.py can then call compiled_gdn(...) directly without going through the
-    full chunk_gated_delta_rule wrapper each iteration.
+    Callers may pass q/k/v as 3D (T, H, D); this function unsqueezes to 4D
+    internally for compilation when needed. On cache hit, returns the cached
+    bundle with no extra tensor operations.
     """
+    # q may be 3D (T,H,D) or 4D (1,T,H,D). Normalize for problem_size using 4D shape.
+    q_shape_4d = q.shape if q.dim() == 4 else (1,) + tuple(q.shape)
+    v_shape_4d = v.shape if v.dim() == 4 else (1,) + tuple(v.shape)
+
     problem_size = _get_problem_size(
-        tuple(q.shape), tuple(v.shape), num_seqs, max_s_q, sum_s_q,
+        tuple(q_shape_4d), tuple(v_shape_4d), num_seqs, max_s_q, sum_s_q,
     )
     bundle_key = (problem_size, float(normalized_scale), path_name)
 
@@ -4502,7 +4507,7 @@ def get_gdn_bundle(
     if cached is not None:
         return cached
 
-    output = _get_output(tuple(v.shape), v.dtype, v.device)
+    output = _get_output(tuple(v_shape_4d), v.dtype, v.device)
     output_state = _get_state(
         (problem_size[0], problem_size[4], problem_size[5], problem_size[5]),
         q.device,
@@ -4513,11 +4518,16 @@ def get_gdn_bundle(
     compiled_gdn = compiled_cache.get(compiled_key)
 
     if compiled_gdn is None:
+        # Ensure 4D for compilation
+        q4 = q if q.dim() == 4 else q.unsqueeze(0)
+        k4 = k if k.dim() == 4 else k.unsqueeze(0)
+        v4 = v if v.dim() == 4 else v.unsqueeze(0)
+
         current_stream = _get_stream()
         gdn = GDN()
-        q_tensor = from_dlpack(q, assumed_align=16, enable_tvm_ffi=True)
-        k_tensor = from_dlpack(k, assumed_align=16, enable_tvm_ffi=True)
-        v_tensor = from_dlpack(v, assumed_align=16, enable_tvm_ffi=True)
+        q_tensor = from_dlpack(q4, assumed_align=16, enable_tvm_ffi=True)
+        k_tensor = from_dlpack(k4, assumed_align=16, enable_tvm_ffi=True)
+        v_tensor = from_dlpack(v4, assumed_align=16, enable_tvm_ffi=True)
         o_tensor = from_dlpack(output, assumed_align=16, enable_tvm_ffi=True)
         gate_tensor = from_dlpack(g, assumed_align=16, enable_tvm_ffi=True)
         beta_tensor = from_dlpack(beta, assumed_align=16, enable_tvm_ffi=True)

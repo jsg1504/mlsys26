@@ -25,6 +25,7 @@ image = (
         add_python="3.12",
     )
     .pip_install("flashinfer-bench", "torch", "triton", "numpy")
+    .env({"TVM_FFI_CUDA_ARCH_LIST": "10.0a"})
 )
 
 

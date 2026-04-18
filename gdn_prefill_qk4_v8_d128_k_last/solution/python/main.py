@@ -112,7 +112,9 @@ def _get_gate_tensors(T, device):
         return cached
     gate_log = torch.empty(T, 8, dtype=torch.float32, device=device)
     beta = torch.empty(T, 8, dtype=torch.float32, device=device)
-    tensors = (gate_log, beta, gate_log.unsqueeze(0), beta.unsqueeze(0))
+    # Cache data_ptr values alongside tensors (stable for cached tensors)
+    tensors = (gate_log, beta, gate_log.unsqueeze(0), beta.unsqueeze(0),
+               gate_log.data_ptr(), beta.data_ptr())
     _gate_cache[key] = tensors
     return tensors
 
@@ -178,15 +180,15 @@ def run(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, scale):
         meta = get_cu_seqlens_metadata(cu_seqlens)
         max_s_q = meta["max_s_q"]
 
-        gate_log, beta, gate_log_4d, beta_4d = _get_gate_tensors(T, q.device)
+        gate_log, beta, gate_log_4d, beta_4d, gate_log_ptr, beta_ptr = _get_gate_tensors(T, q.device)
 
         ga = _gate_args
         ga.p0.value = A_log.data_ptr()
         ga.p1.value = a.data_ptr()
         ga.p2.value = dt_bias.data_ptr()
         ga.p3.value = b.data_ptr()
-        ga.p4.value = gate_log.data_ptr()
-        ga.p5.value = beta.data_ptr()
+        ga.p4.value = gate_log_ptr
+        ga.p5.value = beta_ptr
         ga.p6.value = T
 
         _cuLaunchKernel(
@@ -199,7 +201,8 @@ def run(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, scale):
         path_name = "small" if T <= 1024 and num_seqs <= 8 else "large"
 
         # Fast path: get cached compiled kernel + output/state tensors directly.
-        compiled_gdn, output, output_state, problem_size, normalized_scale, output_3d = get_gdn_bundle(
+        (compiled_gdn, output, output_state, problem_size, normalized_scale,
+         output_3d, output_ptr, output_state_ptr) = get_gdn_bundle(
             q, k, v, gate_log_4d, beta_4d, state, cu_seqlens,
             num_seqs, T, max_s_q, path_name, scale,
         )
@@ -208,12 +211,12 @@ def run(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, scale):
             q.data_ptr(),
             k.data_ptr(),
             v.data_ptr(),
-            output.data_ptr(),
-            gate_log_4d.data_ptr(),
-            beta_4d.data_ptr(),
+            output_ptr,
+            gate_log_ptr,
+            beta_ptr,
             problem_size,
             state.data_ptr(),
-            output_state.data_ptr(),
+            output_state_ptr,
             normalized_scale,
             cu_seqlens,
             stream=stream,

@@ -4471,6 +4471,83 @@ def _get_state(shape, device):
     return t
 
 
+_bundle_cache = {}
+
+
+def get_gdn_bundle(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    initial_state: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    num_seqs: int,
+    sum_s_q: int,
+    max_s_q: int,
+    path_name: str,
+    normalized_scale: float,
+):
+    """Fast-path entry: returns (compiled_gdn, output, output_state) for direct invocation.
+
+    main.py can then call compiled_gdn(...) directly without going through the
+    full chunk_gated_delta_rule wrapper each iteration.
+    """
+    problem_size = _get_problem_size(
+        tuple(q.shape), tuple(v.shape), num_seqs, max_s_q, sum_s_q,
+    )
+    bundle_key = (problem_size, float(normalized_scale), path_name)
+
+    cached = _bundle_cache.get(bundle_key)
+    if cached is not None:
+        return cached
+
+    output = _get_output(tuple(v.shape), v.dtype, v.device)
+    output_state = _get_state(
+        (problem_size[0], problem_size[4], problem_size[5], problem_size[5]),
+        q.device,
+    )
+
+    compiled_cache = _get_compiled_gdn_prefill_kernel(path_name)["compiled_by_signature"]
+    compiled_key = (problem_size, float(normalized_scale))
+    compiled_gdn = compiled_cache.get(compiled_key)
+
+    if compiled_gdn is None:
+        current_stream = _get_stream()
+        gdn = GDN()
+        q_tensor = from_dlpack(q, assumed_align=16, enable_tvm_ffi=True)
+        k_tensor = from_dlpack(k, assumed_align=16, enable_tvm_ffi=True)
+        v_tensor = from_dlpack(v, assumed_align=16, enable_tvm_ffi=True)
+        o_tensor = from_dlpack(output, assumed_align=16, enable_tvm_ffi=True)
+        gate_tensor = from_dlpack(g, assumed_align=16, enable_tvm_ffi=True)
+        beta_tensor = from_dlpack(beta, assumed_align=16, enable_tvm_ffi=True)
+        cu_seqlens_tensor = from_dlpack(cu_seqlens, assumed_align=16, enable_tvm_ffi=True)
+        state_tensor = from_dlpack(initial_state, assumed_align=16, enable_tvm_ffi=True)
+        state_output_tensor = from_dlpack(output_state, assumed_align=16, enable_tvm_ffi=True)
+
+        options = EnableTVMFFI
+        compiled_gdn = cute.compile[options](
+            gdn,
+            q_tensor.iterator,
+            k_tensor.iterator,
+            v_tensor.iterator,
+            o_tensor.iterator,
+            gate_tensor.iterator,
+            beta_tensor.iterator,
+            problem_size,
+            state_tensor.iterator,
+            state_output_tensor.iterator,
+            normalized_scale,
+            cu_seqlens_tensor,
+            stream=current_stream,
+        )
+        compiled_cache[compiled_key] = compiled_gdn
+
+    bundle = (compiled_gdn, output, output_state, problem_size, normalized_scale)
+    _bundle_cache[bundle_key] = bundle
+    return bundle
+
+
 def chunk_gated_delta_rule(
     *,
     q: torch.Tensor,

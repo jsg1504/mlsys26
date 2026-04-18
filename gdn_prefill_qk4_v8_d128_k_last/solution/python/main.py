@@ -11,11 +11,11 @@ import cuda.bindings.driver as drv
 
 try:
     from .nvrtc_loader import compile_and_load
-    from .gdn_blackwell import chunk_gated_delta_rule
+    from .gdn_blackwell import chunk_gated_delta_rule, get_gdn_bundle
     from .prefill_contract import get_cu_seqlens_metadata
 except ImportError:
     from nvrtc_loader import compile_and_load
-    from gdn_blackwell import chunk_gated_delta_rule
+    from gdn_blackwell import chunk_gated_delta_rule, get_gdn_bundle
     from prefill_contract import get_cu_seqlens_metadata
 
 THRESHOLD = 128
@@ -197,18 +197,29 @@ def run(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, scale):
         )
 
         path_name = "small" if T <= 1024 and num_seqs <= 8 else "large"
+        q4 = q.unsqueeze(0)
+        k4 = k.unsqueeze(0)
+        v4 = v.unsqueeze(0)
 
-        output, new_state = chunk_gated_delta_rule(
-            q=q.unsqueeze(0),
-            k=k.unsqueeze(0),
-            v=v.unsqueeze(0),
-            g=gate_log_4d,
-            beta=beta_4d,
-            initial_state=state,
-            cu_seqlens=cu_seqlens,
-            scale=scale,
-            path_name=path_name,
-            precomputed_max_s_q=max_s_q,
+        # Fast path: get cached compiled kernel + output/state tensors directly
+        compiled_gdn, output, output_state, problem_size, normalized_scale = get_gdn_bundle(
+            q4, k4, v4, gate_log_4d, beta_4d, state, cu_seqlens,
+            num_seqs, T, max_s_q, path_name, scale,
         )
 
-        return output.squeeze(0), new_state
+        compiled_gdn(
+            q4.data_ptr(),
+            k4.data_ptr(),
+            v4.data_ptr(),
+            output.data_ptr(),
+            gate_log_4d.data_ptr(),
+            beta_4d.data_ptr(),
+            problem_size,
+            state.data_ptr(),
+            output_state.data_ptr(),
+            normalized_scale,
+            cu_seqlens,
+            stream=stream,
+        )
+
+        return output.squeeze(0), output_state

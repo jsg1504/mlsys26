@@ -101,12 +101,13 @@ def print_results(results: dict):
 
 
 @app.local_entrypoint()
-def main(subfolder: str, quick: bool = True):
+def main(subfolder: str, quick: bool = True, isolated: bool = False):
     """Load pre-packed solution.json from subfolder and run benchmark on Modal.
 
     Args:
         subfolder: Which subfolder to benchmark (e.g. gdn_decode_qk4_v8_d128_k_last)
         quick: Use fast config for development (default). Pass --no-quick for final submission.
+        isolated: If True, run each workload in an isolated subprocess (use_isolated_runner).
     """
     import scripts.pack_solution as ps
     ps.PROJECT_ROOT = PROJECT_ROOT / subfolder
@@ -117,11 +118,13 @@ def main(subfolder: str, quick: bool = True):
     print(f"Loaded: {solution.name} ({solution.definition})")
 
     if quick:
-        config = BenchmarkConfig(warmup_runs=1, iterations=3, num_trials=1)
-        print("\nRunning benchmark on Modal B200 (quick mode)...")
+        config = BenchmarkConfig(warmup_runs=1, iterations=3, num_trials=1, use_isolated_runner=isolated)
+        mode = "quick mode"
     else:
-        config = BenchmarkConfig(warmup_runs=3, iterations=100, num_trials=5)
-        print("\nRunning benchmark on Modal B200 (full mode)...")
+        config = BenchmarkConfig(warmup_runs=3, iterations=100, num_trials=5, use_isolated_runner=isolated)
+        mode = "full mode"
+    iso = " + isolated runner" if isolated else ""
+    print(f"\nRunning benchmark on Modal B200 ({mode}{iso})...")
 
     results = run_benchmark.remote(solution, config)
 

@@ -67,18 +67,16 @@ class GDN:
 
     def __init__(
         self,
-        is_persistent: bool = False,
-        chunk_size: Int32 = 128,  # Only 128 is supported in current version
-        head_dim: Int32 = 128,  # Only 128 is supported in current version
+        is_persistent: bool = True,
+        chunk_size: Int32 = 128,
+        head_dim: Int32 = 128,
     ):
-        if is_persistent:
-            raise ValueError("Task 5 runtime only supports non-persistent mode.")
         if chunk_size != 128:
-            raise ValueError("Task 5 runtime only supports chunk_size == 128.")
+            raise ValueError("Only chunk_size == 128 is supported.")
         if head_dim != 128:
-            raise ValueError("Task 5 runtime only supports head_dim == 128.")
+            raise ValueError("Only head_dim == 128 is supported.")
         self.chunk_size = chunk_size
-        self.is_persistent = False
+        self.is_persistent = is_persistent
 
         self.head_dim = head_dim
         self.cta_tiler = (chunk_size, chunk_size, head_dim)
@@ -4401,7 +4399,7 @@ class GDN:
         cta_tiler: Tuple[int, int, int],
     ) -> Tuple[GdnStaticTileSchedulerParams, Tuple[int, int, int]]:
         tile_sched_params = create_gdn_static_tile_scheduler_params(
-            False,
+            True,
             (
                 cute.ceil_div(cute.size(o_shape[1]), cta_tiler[2]),
                 cute.size(o_shape[2][0]),

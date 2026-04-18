@@ -24,6 +24,15 @@ Tracking all optimization iterations for the prefill kernel.
 - Correctness envelope on this run: max abs error `9.09e-03`, max rel error `3.29e+03`.
 - This full run still uses the same dispatch split: `small` when `total_seq_len <= 1024` and `num_seqs <= 8`, otherwise `large`.
 
+## 2026-04-19 - CUDA graph capture for long path (REVERTED)
+
+- **Idea**: Capture both fused_gate_kernel and TVM-FFI compiled_gdn launches into a CUDA graph via `cuStreamBeginCapture`/`cuStreamEndCapture`, then replay on subsequent iterations. Should eliminate ~10-15us TVM FFI + launch overhead per long-path call.
+- **Implementation**: Three-tier dispatch (direct launch → capture on 2nd call → replay on 3rd+). Pre-allocated graph input buffers with `.copy_(non_blocking=True)` to update inputs before replay.
+- **Result**: Capture failed for 59/60 shapes. Mean unchanged (0.2235ms ≈ baseline 0.2229ms).
+- **Status**: reverted
+- **Why it failed**: TVM FFI's `compiled_gdn(...)` call does host-side work (Python→C++ argument marshaling, dict lookups inside the compiled PackedFunc) that breaks CUDA stream capture. `cuStreamBeginCapture` returned SUCCESS, but the subsequent compiled_gdn call caused the stream to exit capture mode with an invalid state, so `cuStreamEndCapture` failed.
+- **Learning**: CUDA graphs are incompatible with CuTe-DSL + TVM FFI compiled kernels. To use graphs, would need to extract the raw CUDA module/function handle from the compiled object (not exposed by CuTe-DSL's public API) and call `cuLaunchKernel` directly. Infeasible without deep TVM FFI internals modification.
+
 ## 2026-04-18 (session 3) - Threshold re-tune after dispatch opts (ACCEPTED)
 
 - **Idea**: With the fast-launch and bundle-cache reducing CuTe-DSL per-call overhead, the optimal sequential/CuTe-DSL crossover may have shifted.

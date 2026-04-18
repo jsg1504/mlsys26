@@ -24,6 +24,15 @@ Tracking all optimization iterations for the prefill kernel.
 - Correctness envelope on this run: max abs error `9.09e-03`, max rel error `3.29e+03`.
 - This full run still uses the same dispatch split: `small` when `total_seq_len <= 1024` and `num_seqs <= 8`, otherwise `large`.
 
+## 2026-04-18 (session 3) - Threshold re-tune after dispatch opts (ACCEPTED)
+
+- **Idea**: With the fast-launch and bundle-cache reducing CuTe-DSL per-call overhead, the optimal sequential/CuTe-DSL crossover may have shifted.
+- **Sweep results**: T=16→0.2265, T=32→~0.225, T=64→**~0.223**, T=128→0.2265
+- **Result**: 0.2265ms → 0.2229ms (-1.6%)
+- **Status**: accepted, THRESHOLD=64 is new optimum
+- **Cumulative**: 0.282 → 0.2229ms (-21.0%)
+- **Remaining gap to 0.2ms**: 11%
+
 ## 2026-04-18 (session 2) - Deep Python dispatch + fast-launch (ACCEPTED, cumulative)
 
 Second optimization pass targeting all remaining Python-side overhead.

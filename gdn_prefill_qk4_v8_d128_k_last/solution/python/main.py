@@ -10,11 +10,11 @@ import torch
 import cuda.bindings.driver as drv
 
 try:
-    from .nvrtc_loader import compile_and_load, launch
+    from .nvrtc_loader import compile_and_load
     from .gdn_blackwell import chunk_gated_delta_rule
     from .prefill_contract import get_cu_seqlens_metadata
 except ImportError:
-    from nvrtc_loader import compile_and_load, launch
+    from nvrtc_loader import compile_and_load
     from gdn_blackwell import chunk_gated_delta_rule
     from prefill_contract import get_cu_seqlens_metadata
 
@@ -26,30 +26,28 @@ _gate_cache = {}
 _seq_output_cache = {}
 _seq_state_cache = {}
 
-# Pre-created ctypes constants
-_INT32_8 = ctypes.c_int32(8)
-_BLOCK_128 = (128, 1, 1)
-_BLOCK_256 = (256, 1, 1)
+_c_uint64 = ctypes.c_uint64
+_c_int32 = ctypes.c_int32
+_c_float = ctypes.c_float
+_c_void_p = ctypes.c_void_p
+_addressof = ctypes.addressof
+_cuLaunchKernel = drv.cuLaunchKernel
+
 
 def _get_kernel_dir() -> Path:
     return Path(__file__).parent / "nvrtc_kernels"
+
 
 def _ensure_kernels():
     if _kernels:
         return
     kdir = _get_kernel_dir()
-
     seq_src = (kdir / "sequential_kernel.cu").read_text()
     seq_fns = compile_and_load(seq_src, ["gdn_prefill_sequential"])
     _kernels["sequential"] = seq_fns["gdn_prefill_sequential"]
-
     gate_src = (kdir / "fused_gate_kernel.cu").read_text()
     gate_fns = compile_and_load(gate_src, ["fused_gate_kernel"])
     _kernels["fused_gate"] = gate_fns["fused_gate_kernel"]
-
-
-def _ptr(t: torch.Tensor):
-    return ctypes.c_uint64(t.data_ptr())
 
 
 def _get_stream():
@@ -59,6 +57,54 @@ def _get_stream():
     return _cached_stream
 
 
+# Pre-allocated ctypes args for sequential kernel (13 params)
+class _SeqArgs:
+    __slots__ = ('p0','p1','p2','p3','p4','p5','p6','p7','p8','p9','p10','p11','p12','arr')
+    def __init__(self):
+        self.p0 = _c_uint64(0)
+        self.p1 = _c_uint64(0)
+        self.p2 = _c_uint64(0)
+        self.p3 = _c_uint64(0)
+        self.p4 = _c_uint64(0)
+        self.p5 = _c_uint64(0)
+        self.p6 = _c_uint64(0)
+        self.p7 = _c_uint64(0)
+        self.p8 = _c_uint64(0)
+        self.p9 = _c_float(0)
+        self.p10 = _c_uint64(0)
+        self.p11 = _c_uint64(0)
+        self.p12 = _c_int32(0)
+        self.arr = (_c_void_p * 13)(
+            _addressof(self.p0), _addressof(self.p1), _addressof(self.p2),
+            _addressof(self.p3), _addressof(self.p4), _addressof(self.p5),
+            _addressof(self.p6), _addressof(self.p7), _addressof(self.p8),
+            _addressof(self.p9), _addressof(self.p10), _addressof(self.p11),
+            _addressof(self.p12),
+        )
+
+_seq_args = _SeqArgs()
+
+# Pre-allocated ctypes args for fused gate kernel (8 params)
+class _GateArgs:
+    __slots__ = ('p0','p1','p2','p3','p4','p5','p6','p7','arr')
+    def __init__(self):
+        self.p0 = _c_uint64(0)
+        self.p1 = _c_uint64(0)
+        self.p2 = _c_uint64(0)
+        self.p3 = _c_uint64(0)
+        self.p4 = _c_uint64(0)
+        self.p5 = _c_uint64(0)
+        self.p6 = _c_int32(0)
+        self.p7 = _c_int32(8)
+        self.arr = (_c_void_p * 8)(
+            _addressof(self.p0), _addressof(self.p1), _addressof(self.p2),
+            _addressof(self.p3), _addressof(self.p4), _addressof(self.p5),
+            _addressof(self.p6), _addressof(self.p7),
+        )
+
+_gate_args = _GateArgs()
+
+
 def _get_gate_tensors(T, device):
     key = (T, device)
     cached = _gate_cache.get(key)
@@ -66,7 +112,6 @@ def _get_gate_tensors(T, device):
         return cached
     gate_log = torch.empty(T, 8, dtype=torch.float32, device=device)
     beta = torch.empty(T, 8, dtype=torch.float32, device=device)
-    # Pre-compute 4D views to avoid .unsqueeze(0) per call
     tensors = (gate_log, beta, gate_log.unsqueeze(0), beta.unsqueeze(0))
     _gate_cache[key] = tensors
     return tensors
@@ -106,34 +151,49 @@ def run(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, scale):
         output = _get_seq_output(T, q.device)
         new_state = _get_seq_state(state)
 
-        grid = (num_seqs * 8, 1, 1)
+        sa = _seq_args
+        sa.p0.value = q.data_ptr()
+        sa.p1.value = k.data_ptr()
+        sa.p2.value = v.data_ptr()
+        sa.p3.value = state.data_ptr()
+        sa.p4.value = A_log.data_ptr()
+        sa.p5.value = a.data_ptr()
+        sa.p6.value = dt_bias.data_ptr()
+        sa.p7.value = b.data_ptr()
+        sa.p8.value = cu_seqlens.data_ptr()
+        sa.p9.value = scale
+        sa.p10.value = output.data_ptr()
+        sa.p11.value = new_state.data_ptr()
+        sa.p12.value = num_seqs
 
-        launch(
-            _kernels["sequential"], grid, _BLOCK_128,
-            [_ptr(q), _ptr(k), _ptr(v), _ptr(state),
-             _ptr(A_log), _ptr(a), _ptr(dt_bias), _ptr(b),
-             _ptr(cu_seqlens), ctypes.c_float(scale),
-             _ptr(output), _ptr(new_state), ctypes.c_int32(num_seqs)],
-            shared_mem=0, stream=stream,
+        _cuLaunchKernel(
+            _kernels["sequential"],
+            num_seqs * 8, 1, 1,
+            128, 1, 1,
+            0, stream, sa.arr, 0,
         )
         return output, new_state
 
     else:
-        # Use cached metadata (no GPU sync on cache hit)
         meta = get_cu_seqlens_metadata(cu_seqlens)
         max_s_q = meta["max_s_q"]
 
-        # Reuse pre-allocated gate tensors (4D views pre-computed)
         gate_log, beta, gate_log_4d, beta_4d = _get_gate_tensors(T, q.device)
 
-        blocks_gate = (T * 8 + 255) // 256
+        ga = _gate_args
+        ga.p0.value = A_log.data_ptr()
+        ga.p1.value = a.data_ptr()
+        ga.p2.value = dt_bias.data_ptr()
+        ga.p3.value = b.data_ptr()
+        ga.p4.value = gate_log.data_ptr()
+        ga.p5.value = beta.data_ptr()
+        ga.p6.value = T
 
-        launch(
-            _kernels["fused_gate"], (blocks_gate, 1, 1), _BLOCK_256,
-            [_ptr(A_log), _ptr(a), _ptr(dt_bias), _ptr(b),
-             _ptr(gate_log), _ptr(beta),
-             ctypes.c_int32(T), _INT32_8],
-            shared_mem=0, stream=stream,
+        _cuLaunchKernel(
+            _kernels["fused_gate"],
+            (T * 8 + 255) // 256, 1, 1,
+            256, 1, 1,
+            0, stream, ga.arr, 0,
         )
 
         path_name = "small" if T <= 1024 and num_seqs <= 8 else "large"

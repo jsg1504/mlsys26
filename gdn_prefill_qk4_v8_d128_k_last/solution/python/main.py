@@ -23,6 +23,8 @@ _DEFAULT_SCALE = 128 ** -0.5
 _kernels = {}
 _cached_stream = None
 _gate_cache = {}
+_seq_output_cache = {}
+_seq_state_cache = {}
 
 # Pre-created ctypes constants
 _INT32_8 = ctypes.c_int32(8)
@@ -70,6 +72,26 @@ def _get_gate_tensors(T, device):
     return tensors
 
 
+def _get_seq_output(T, device):
+    key = (T, device)
+    cached = _seq_output_cache.get(key)
+    if cached is not None:
+        return cached
+    t = torch.empty(T, 8, 128, dtype=torch.bfloat16, device=device)
+    _seq_output_cache[key] = t
+    return t
+
+
+def _get_seq_state(state):
+    key = (tuple(state.shape), state.dtype, state.device)
+    cached = _seq_state_cache.get(key)
+    if cached is not None:
+        return cached
+    t = torch.empty_like(state)
+    _seq_state_cache[key] = t
+    return t
+
+
 def run(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, scale):
     _ensure_kernels()
 
@@ -81,8 +103,8 @@ def run(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, scale):
         scale = _DEFAULT_SCALE
 
     if T <= THRESHOLD:
-        output = torch.empty(T, 8, 128, dtype=torch.bfloat16, device=q.device)
-        new_state = torch.empty_like(state)
+        output = _get_seq_output(T, q.device)
+        new_state = _get_seq_state(state)
 
         grid = (num_seqs * 8, 1, 1)
 

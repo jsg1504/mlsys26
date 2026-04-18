@@ -199,9 +199,7 @@ def run(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, scale):
         path_name = "small" if T <= 1024 and num_seqs <= 8 else "large"
 
         # Fast path: get cached compiled kernel + output/state tensors directly.
-        # get_gdn_bundle does unsqueeze internally on cache miss for compilation;
-        # on cache hit we skip all view creation and use raw data_ptrs.
-        compiled_gdn, output, output_state, problem_size, normalized_scale = get_gdn_bundle(
+        compiled_gdn, output, output_state, problem_size, normalized_scale, output_3d = get_gdn_bundle(
             q, k, v, gate_log_4d, beta_4d, state, cu_seqlens,
             num_seqs, T, max_s_q, path_name, scale,
         )
@@ -221,4 +219,4 @@ def run(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, scale):
             stream=stream,
         )
 
-        return output.squeeze(0), output_state
+        return output_3d, output_state

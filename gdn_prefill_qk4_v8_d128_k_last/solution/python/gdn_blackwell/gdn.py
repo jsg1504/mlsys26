@@ -4553,7 +4553,9 @@ def get_gdn_bundle(
         )
         compiled_cache[compiled_key] = compiled_gdn
 
-    bundle = (compiled_gdn, output, output_state, problem_size, normalized_scale)
+    # Cache both 4D output (for kernel) and 3D squeezed view (for returning)
+    output_3d = output.squeeze(0)
+    bundle = (compiled_gdn, output, output_state, problem_size, normalized_scale, output_3d)
     _bundle_cache[bundle_key] = bundle
     return bundle
 

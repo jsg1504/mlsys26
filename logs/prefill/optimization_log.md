@@ -6,6 +6,17 @@ Tracking all optimization iterations for the prefill kernel.
 
 <!-- Append new entries below this line -->
 
+## 2026-04-20 - L1 Broadcast in Sequential Kernel (ACCEPTED)
+
+- **Idea**: Replace shared memory k/q broadcast with direct L1 cache reads. The sequential kernel used `__shared__ float s_k[128], s_q[128]` + two `__syncthreads()` per token to broadcast k/q to all 128 threads. Since all threads need to read the same 128 k values and 128 q values, we instead have all threads read directly from global memory using `__ldg()`. With `__launch_bounds__(128,1)` only 1 block/SM, the full 228KB L1 is available. k/q vectors (256B each = 2 cache lines) hit L1 after the first warp's access.
+- **Changes**: (1) Removed `__shared__ float s_k[HEAD_DIM]`, `s_q[HEAD_DIM]`, (2) Removed both `__syncthreads()` calls, (3) All k/q accesses go through `__ldg()` on global pointers, (4) k is read twice per token (kS accumulation + state update) — second read is L1 hit.
+- **Result**: 0.2228ms → **0.2098ms (-5.8%)**
+- **Status**: accepted
+- **Correctness**: 100/100 pass, max_atol=0.00909, matched_ratio=1.0
+- **Distribution**: 45 workloads <0.1ms, 17 workloads >0.5ms (CuTe-DSL, unchanged). Min 0.041ms.
+- **Cumulative**: 0.282ms → 0.2098ms (-25.6%)
+- **Learning**: On Blackwell with single-occupancy blocks, L1 broadcast reads are as efficient as shared memory broadcast but eliminate costly barriers. The 2 `__syncthreads()` per token were a significant fraction of sequential kernel time, especially for short sequences (T=6-64 where barrier overhead dominates over compute). The fast workloads (<0.1ms) improved from ~40 to 45 count, showing the barrier elimination primarily helps the shortest sequences.
+
 ## 2026-04-15 00:58 +09:00
 
 - HEAD `4660730`
@@ -23,6 +34,59 @@ Tracking all optimization iterations for the prefill kernel.
 - Full-workload metrics: mean latency `0.3426 ms`, mean speedup `488.44x`, min/max latency `0.1924 / 1.0576 ms`, min/max speedup `6.50x / 2149.36x`.
 - Correctness envelope on this run: max abs error `9.09e-03`, max rel error `3.29e+03`.
 - This full run still uses the same dispatch split: `small` when `total_seq_len <= 1024` and `num_seqs <= 8`, otherwise `large`.
+
+## 2026-04-19 — Model C Exploration (CuTe DSL pingpong / stage tuning) — BLOCKED by scope
+
+- **Hypothesis**: "Increasing pipeline stage depth (e.g., epi_stage 1→2, kv_stage 1→2) or enabling cluster_shape_mnk=(2,1,1) in the vendored CuTe DSL kernel will hide more non-MMA latency behind MMA, reducing per-chunk time by ~20%."
+- **Phase**: Exploration (attempt 2)
+- **Status**: NOT ATTEMPTED — scope blocker identified
+- **Why not attempted**:
+  1. Stage parameters (q_stage, kv_stage, qk_stage, epi_stage, mma_cudacore_stage, mma_qk_stage) are interdependent with mbarrier allocation sizes (line 4259-4261), TMEM column layout (line 134-149), and pipeline producer-consumer classes (line 263-333). A single integer bump risks silent deadlocks or races.
+  2. `cluster_shape_mnk` change propagates through `tcgen05.make_trivial_tiled_mma` cta_group argument (line 3932), cluster_layout_vmnk (3936), TMA descriptor setup, and kernel launch (line 4391). Multi-site coordinated edit required.
+  3. Pingpong warpgroup refactor (FA3-style) requires splitting the 128-thread cudacore warp group into two 64-thread sub-groups with alternating MMA/non-MMA work. Rebalance of barrier IDs, pipeline stages, and TMEM allocation. Multi-session effort.
+  4. Without local B200 access, each blind modification requires a ~10min Modal benchmark to validate correctness. The exploration budget (3 iterations per §2.6) cannot absorb the search space of inter-dependent stage parameters.
+- **Hypothesis 판정**: not applicable (not attempted)
+- **Status decision**: Session exploration budget exhausted after Model B falsification. Further work on Model C/A requires a dedicated multi-session effort with careful incremental CuTe DSL modifications and local B200 access for rapid iteration.
+- **Learning**: When a vendored kernel uses complex DSL pipelines with tightly-coupled stage/cluster/TMEM/mbarrier parameters, optimizing it remotely (no local GPU) via blind edit-and-benchmark loops is impractical within a single session budget. Future work needs either (a) local B200 for fast iteration, (b) a from-scratch rewrite in a simpler framework (not Triton — falsified), or (c) CUTLASS example code that demonstrates the exact cluster + pingpong pattern for us to port.
+
+## 2026-04-19 — Model B Exploration (FLA Triton adaptation) (REVERTED)
+
+- **Hypothesis**: "FLA's Triton chunk_gated_delta_rule (chunk_size=64, forward-substitution solve, SSD-adjacent structure) will reduce long-tail 17 workloads' mean latency by ≥15% because it (a) halves per-chunk MMA-inversion cost, (b) enables better SM utilization via smaller tiles."
+- **Phase**: Exploration (iteration 1)
+- **바꾼 structural idea**: Replace vendored CuTe-DSL chunked kernel (chunk_size=128, 2-level blocked inversion) with FLA's Triton kernel (chunk_size=64, forward-substitution). Expand q/k from 4 heads to 8 to fit FLA's non-GVA head contract.
+- **성능 변화**:
+  - 100-workload mean: 0.2228 → **0.6593 ms (+196%)** — MAJOR REGRESSION
+  - Long-tail >0.5ms count: 17 → 72 (55 extra workloads became long-tail)
+  - Max latency: 0.9 → 1.06 ms
+- **Correctness**: 100/100 pass (atol=1, rtol=0.3)
+- **Hypothesis 판정**: **FALSIFIED**
+- **근거**:
+  1. Triton's Blackwell (sm_100a) backend does NOT use tcgen05 WGMMA as efficiently as CuTe DSL. The vendored kernel's 10+ tcgen05 MMAs per chunk are faster than FLA's Triton `tl.dot`.
+  2. FLA's chunk_size=64 produces 2x more chunks for long sequences (128 vs 64 chunks at T=8192), doubling inter-chunk sequential overhead.
+  3. FLA is not GVA-aware; q/k expansion 4→8 heads doubles the q·k^T MMA work.
+  4. Regression is consistent across ALL T>64 workloads, not isolated — indicates fundamental backend mismatch, not tuning issue.
+- **Status**: REVERTED. USE_FLA default=0; FLA adapter code kept in main.py:227-249 as dead code for future reference.
+- **다음 iteration**: 
+  - **버림**: FLA-Triton path (falsified, cannot retry per §2.7).
+  - **계속**: Pivot to Model C (FA3 pingpong warpgroup inside CuTe DSL) or Model A (TFLA intra-chunk sub-tiling). Both require deep modification of the vendored kernel (gdn.py). Next iteration: analyze feasibility of a minimal pingpong refactor.
+- **Learning**: When the baseline is a highly-tuned CuTe DSL kernel on Blackwell, replacing it with a Triton port rarely wins — Triton's codegen for tcgen05 is still maturing. The remaining 10% gap must be found INSIDE the vendored kernel (warp-group layout, barrier relaxation, cluster usage) rather than via replacement.
+
+## 2026-04-19 - max_s_q-based dispatch (REVERTED, all three variants)
+
+Explored per-sequence-aware dispatch to route multi-seq batches with short individual sequences away from CuTe-DSL. Three variants tested:
+
+| Variant | Mean (ms) | Δ vs 0.2228 baseline | Status |
+|---|---|---|---|
+| SEQ_THRESHOLD=128 (max_s_q<=128 → sequential) | 0.2314 | +3.9% | REGRESSION |
+| SEQ_THRESHOLD=64 (max_s_q<=64 → sequential) | 0.2211 | -0.8% | noise |
+| MULTI_SEQ_THRESHOLD=128 (multi-seq only) | 0.2234 | +0.3% | noise |
+
+- **Idea**: Current dispatch `T <= 64` sends multi-seq batches (e.g., 10 sequences each of length 20, T=200, max_s_q=20) to CuTe-DSL unnecessarily. Routing on max_s_q captures these.
+- **Why SEQ_THRESHOLD=128 regressed**: Single-seq workloads with T=65-128 moved to sequential where per-token cost × max_s_q (~5.7us/token × 128 = 730us) exceeds CuTe-DSL's single-chunk cost (~100-200us).
+- **Why SEQ_THRESHOLD=64 was neutral**: The workload distribution (median T=139, median num_seqs=2) contains few multi-seq batches with max_s_q ≤ 64 AND T > 64. Capture set is essentially empty.
+- **Why MULTI_SEQ_THRESHOLD=128 was neutral**: Same — very few multi-seq batches with max_s_q in (64, 128] exist in the test set.
+- **Status**: all three reverted
+- **Learning**: The current 100-workload benchmark's shape distribution doesn't expose the dispatch-heuristic lever. To reach sub-0.2ms, the remaining 10% reduction must come from either (a) speeding up the CuTe-DSL kernel itself (4500-line vendored code; previously enabled persistent scheduling but further tuning requires deep modification), or (b) a custom chunked CUDA kernel replacing CuTe-DSL for medium-length workloads (significant engineering, uncertain benefit).
 
 ## 2026-04-19 - Persistent scheduling in CuTe-DSL kernel (ACCEPTED)
 

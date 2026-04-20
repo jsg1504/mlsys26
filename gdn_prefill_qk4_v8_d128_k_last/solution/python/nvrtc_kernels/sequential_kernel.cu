@@ -4,9 +4,10 @@
  * State column (128 fp32) in registers. Gates computed in-kernel.
  *
  * Optimizations:
- *  - Single fused loop: kS accumulation + state update + output in one pass
- *  - k/q prefetch: load next token's k/q while computing current token
- *  - Reduced __syncthreads
+ *  - No shared memory or __syncthreads: k/q broadcast via L1 cache
+ *  - All threads read k/q directly from global memory using __ldg()
+ *  - With __launch_bounds__(128,1) only 1 block/SM, full 228KB L1 available
+ *  - k/q vectors (256B each) fit in ~4 cache lines, hit L1 after first warp
  *
  * Compiled via NVRTC — no TVM/torch dependencies.
  */
@@ -66,9 +67,6 @@ __global__ void gdn_prefill_sequential(
     const int seq_len = (int)(seq_end - seq_start);
     if (seq_len <= 0) return;
 
-    __shared__ float s_k[HEAD_DIM];
-    __shared__ float s_q[HEAD_DIM];
-
     // Load state column into registers
     const float* state_base = state + ((long long)seq * NUM_V_HEADS + vh) * HEAD_DIM * HEAD_DIM;
     float s[HEAD_DIM];
@@ -84,10 +82,9 @@ __global__ void gdn_prefill_sequential(
     for (int t_off = 0; t_off < seq_len; t_off++) {
         const int t = (int)seq_start + t_off;
 
-        // Load k and q for this token
-        s_k[vid] = bf16_to_float(k_ptr[t * NUM_K_HEADS * HEAD_DIM + qkh * HEAD_DIM + vid]);
-        s_q[vid] = bf16_to_float(q_ptr[t * NUM_Q_HEADS * HEAD_DIM + qkh * HEAD_DIM + vid]);
-        __syncthreads();
+        // Compute base pointers for this token's k and q
+        const unsigned short* k_token = (const unsigned short*)(k_ptr + t * NUM_K_HEADS * HEAD_DIM + qkh * HEAD_DIM);
+        const unsigned short* q_token = (const unsigned short*)(q_ptr + t * NUM_Q_HEADS * HEAD_DIM + qkh * HEAD_DIM);
 
         // Gate computation
         float a_val = bf16_to_float(a_in[t * NUM_V_HEADS + vh]);
@@ -96,28 +93,27 @@ __global__ void gdn_prefill_sequential(
         float beta_val = 1.0f / (1.0f + expf(-b_val));
         float v_val = bf16_to_float(v_ptr[t * NUM_V_HEADS * HEAD_DIM + vh * HEAD_DIM + vid]);
 
-        // Fused single-pass: kS + state update + output
-        // Pass 1 (first half): accumulate kS while reading s_k
+        // kS accumulation: all threads read all 128 k values via L1 broadcast
         float kS = 0.0f;
         #pragma unroll
         for (int ki = 0; ki < HEAD_DIM; ki++) {
-            kS += s_k[ki] * s[ki];
+            kS = __fmaf_rn(bf16_to_float(__ldg(&k_token[ki])), s[ki], kS);
         }
         kS *= g;
 
         float residual = beta_val * (v_val - kS);
 
-        // Pass 2: update state and compute output
+        // State update + output: re-read k (L1 hit) and read q
         float out_val = 0.0f;
         #pragma unroll
         for (int ki = 0; ki < HEAD_DIM; ki++) {
-            float new_s = __fmaf_rn(g, s[ki], s_k[ki] * residual);
+            float k_val = bf16_to_float(__ldg(&k_token[ki]));
+            float new_s = __fmaf_rn(g, s[ki], k_val * residual);
             s[ki] = new_s;
-            out_val = __fmaf_rn(s_q[ki], new_s, out_val);
+            out_val = __fmaf_rn(bf16_to_float(__ldg(&q_token[ki])), new_s, out_val);
         }
 
         output[t * NUM_V_HEADS * HEAD_DIM + vh * HEAD_DIM + vid] = float_to_bf16(scale * out_val);
-        __syncthreads();
     }
 
     // Write final state

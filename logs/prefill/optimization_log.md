@@ -6,6 +6,61 @@ Tracking all optimization iterations for the prefill kernel.
 
 <!-- Append new entries below this line -->
 
+## 2026-04-21 - Single-seq max_s_q shortcut (ACCEPTED)
+
+- **Idea**: When `num_seqs == 1`, `max_s_q == T` exactly. Skip the `get_cu_seqlens_metadata` call entirely (which does `.detach().cpu().tolist()` — a GPU→CPU sync) and use `max_s_q = T` directly.
+- **Context discovered**: The flashinfer_bench harness uses `_clone_args` (timing.py:214-220) to clone all tensor arguments before each timed iteration. `get_cu_seqlens_metadata` caches by `id(cu_seqlens)`, so every clone causes a cache miss → forced GPU→CPU sync inside the timed region, costing ~5-10us per miss × 55 CuTe-DSL workloads × 3 timed iters = ~0.8-1.6ms total overhead.
+- **Implementation**: Simple branch in `main.py` — if `num_seqs == 1`, use `max_s_q = T`; else fall through to the original `get_cu_seqlens_metadata` call.
+- **Result**: 0.2098ms → **0.2064ms (-1.6%)**
+- **Status**: accepted
+- **Correctness**: 100/100 pass, max_atol=0.00909 (unchanged)
+- **Distribution**: 48 workloads <0.1ms (was 45), 17 workloads >0.5ms (unchanged). Min 0.041→0.039ms.
+- **Cumulative**: 0.282ms → 0.2064ms (-26.8%)
+- **Learning**: The flashinfer_bench clone-per-iteration pattern renders `id`-keyed caches useless. A value-stable cache key that preserves correctness across workloads is required. For `max_s_q`, the only fully-safe zero-sync shortcut is `num_seqs == 1` (where `max_s_q = T` algebraically). For multi-seq workloads, content-based caching is not viable without a sync to read the content.
+
+## 2026-04-21 - (T, num_seqs) Cache for max_s_q (REVERTED — correctness failure)
+
+- **Idea**: Cache `max_s_q` by `(T, num_seqs)` across all workloads to bypass the `get_cu_seqlens_metadata` sync for BOTH single-seq and multi-seq cases.
+- **Implementation**: Added `_max_s_q_cache = {}` dict in main.py; on cache miss compute via `get_cu_seqlens_metadata`, else return cached value.
+- **Result**: Mean 0.1917ms on 98 workloads (would beat sub-0.2ms target) BUT 2 workloads (`5835a2bc`, `cd979341`) got **RUNTIME_ERROR** with GPU Xid 13 "Illegal Instruction Parameter" and context corruption.
+- **Status**: reverted
+- **Root cause**: `(T, num_seqs)` is NOT unique across the 100-workload benchmark. Two different workloads with same `(T, num_seqs)` but different per-sequence length distributions have different `max_s_q`. Cache returned wrong value for the second workload → CuTe-DSL kernel received mismatched problem_size → compiled kernel assumed wrong tile layout → OOB access or illegal instruction → GPU context corruption.
+- **Learning**: Any Python-side cache that spans workload boundaries must use a collision-free key. Tensor metadata (shape, dtype, device) is insufficient for collision-free identification — the underlying data matters. Content-based keying requires a GPU→CPU sync, defeating the purpose. This is a fundamental limitation: we can cache within a workload (e.g., by tensor id/data_ptr) or across workloads by a metadata key, but not both safely without content comparison.
+
+## 2026-04-21 - 4-way Dot Product Accumulation in Sequential Kernel (REVERTED)
+
+- **Idea**: Break the 128-long serial FMA dependency chains (on `kS` and `out_val` accumulators in the sequential kernel) into 4 independent 32-long chains. Researcher hypothesized this would 4x the effective FMA pipeline utilization on Blackwell's 4-cycle FMA latency.
+- **Implementation**: Modified `sequential_kernel.cu` loops 1 and 2 to use 4 accumulators each with `ki += 4` stride. Preserved `#pragma unroll` directives.
+- **Result**: 0.2098ms → **0.2256ms (+7.5% REGRESSION)**
+- **Status**: reverted
+- **Correctness**: 100/100 pass, max_atol=0.00909 (unchanged)
+- **Distribution**: 44 workloads <0.1ms (was 45), 17 workloads >0.5ms (unchanged). Min 0.041→0.043ms.
+- **Why it failed**:
+  1. NVCC likely already breaks serial FMA chains via instruction scheduling when it has enough ILP headroom — the explicit 4-way source form produced no additional benefit.
+  2. Blackwell FMA latency may be shorter than the researcher's 4-cycle assumption (possibly 2-3 cycles), so the 128-long chain was NOT the bottleneck. With 4 warps × `__launch_bounds__(128,1)`, the scheduler already hid FMA latency via warp interleaving.
+  3. The 4-way version holds 4 live k values + 4 accumulators simultaneously (vs 1 of each in the serial version), increasing register pressure. With 128 state registers per thread + these extras, the compiler may have spilled, slowing the loop.
+  4. Min latency regressed 0.041→0.043ms, confirming the sequential path itself got slower (not just variance).
+- **Learning**: Microarchitectural assumptions about FMA pipeline depth must be verified against actual SASS before making source-level changes. A source transformation that SHOULD help based on a textbook dependency-chain analysis can hurt when the compiler was already achieving the optimal schedule. For future kernel tuning, inspect SASS with `cuobjdump` rather than relying on hypothetical pipeline models.
+
+## 2026-04-21 - Threshold Sweep + Vectorized Loads (ALL REVERTED)
+
+Attempted two optimizations after L1 broadcast; both regressed.
+
+| Attempt | Mean (ms) | Δ vs 0.2098 baseline |
+|---|---|---|
+| T=64 (baseline, re-run) | 0.2090 | -0.4% (noise) |
+| T=72 | 0.2130 | +1.5% |
+| T=96 | 0.2369 | +12.9% |
+| T=128 | 0.2280 | +8.7% |
+| Vectorized uint4 loads | 0.2181 | +4.0% |
+
+- **Threshold sweep**: Even with the faster L1-broadcast kernel, CuTe-DSL remains faster than sequential for T>64. CuTe-DSL processes 1 chunk (128 tokens) in constant time regardless of T=65-128, while sequential scales linearly with T. Crossover is still at T≈64.
+- **Vectorized uint4 loads**: Loading 8 bf16 per uint4 reduced instruction count but increased register pressure, likely causing spills. The compiler was already vectorizing implicitly.
+- **Status**: all reverted, T=64 kept
+- **Stable mean**: 0.209ms ±0.001ms (confirmed with 2 runs)
+- **Remaining gap**: 5% to sub-0.2ms target
+- **Learning**: At 0.209ms, the remaining gap is in the 17 CuTe-DSL workloads (>0.5ms each, contributing ~60% of total time). Closing the gap requires either (a) modifying the vendored CuTe-DSL kernel (infeasible), or (b) writing a custom chunked CUDA kernel with parallel-scan inter-chunk processing for T=65-512 (significant engineering, multi-session effort).
+
 ## 2026-04-20 - L1 Broadcast in Sequential Kernel (ACCEPTED)
 
 - **Idea**: Replace shared memory k/q broadcast with direct L1 cache reads. The sequential kernel used `__shared__ float s_k[128], s_q[128]` + two `__syncthreads()` per token to broadcast k/q to all 128 threads. Since all threads need to read the same 128 k values and 128 q values, we instead have all threads read directly from global memory using `__ldg()`. With `__launch_bounds__(128,1)` only 1 block/SM, the full 228KB L1 is available. k/q vectors (256B each = 2 cache lines) hit L1 after the first warp's access.

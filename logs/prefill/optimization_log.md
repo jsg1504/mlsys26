@@ -6,6 +6,48 @@ Tracking all optimization iterations for the prefill kernel.
 
 <!-- Append new entries below this line -->
 
+## 2026-04-21 - Modal B200 Profiling Analysis (no code change)
+
+Profiled 8 representative workloads on Modal B200 using torch.profiler + CUDA events. Script: `scripts/profile_modal.py`.
+
+### Per-workload overhead breakdown
+
+| Workload | T | num_seqs | Path | Kernel time | Total | **Overhead** |
+|---|---|---|---|---|---|---|
+| 0  | 6    | 1  | seq  | 30.6us  | 44.8us   | **14.2us** |
+| 5  | 8192 | 34 | CuTe | 638us   | 695.6us  | **57us**   |
+| 10 | 8192 | 38 | CuTe | 601us   | 664.8us  | **64us**   |
+| 20 | 3999 | 13 | CuTe | 284us   | 344.4us  | **60us**   |
+| 40 | 139  | 3  | CuTe | 23.6us  | 76.6us   | **53us (69% of total!)** |
+| 60 | 35   | 2  | seq  | 55.7us  | 70.5us   | **14.8us** |
+| 80 | 48   | 1  | seq  | 116.3us | 131.2us  | **14.9us** |
+| 95 | 959  | 4  | CuTe | 92.9us  | 146.5us  | **53.6us** |
+
+### Key findings
+
+1. **Sequential path overhead is a tight ~15us constant** — composed of Python dispatch (~5us), ctypes arg setup (~3us), cuLaunchKernel (~5us), CUDA event recording (~2us). Very hard to reduce further.
+
+2. **CuTe-DSL path overhead is ~50us**, breakdown:
+   - `fused_gate_kernel` launch + GPU time: **~5us** (2us GPU + 3us Python launch)
+   - Multi-seq `cu_seqlens.tolist()` D2H sync: **~3-5us** (single-seq skips this, per earlier fix)
+   - `compiled_gdn` TVM FFI call: **~15-20us** (biggest chunk, marshaling + launch)
+   - Other Python dispatch (dict lookups, data_ptr calls, bundle cache): **~15-20us**
+
+3. **For medium CuTe-DSL workloads (T=100-1000), overhead is 50-70% of total time**. These are the leverage points if overhead can be reduced.
+
+4. **For long CuTe-DSL workloads (>0.5ms), overhead is <10%** — they are dominated by kernel compute. Can't be accelerated without modifying the vendored kernel.
+
+### Remaining optimization space (not pursued this iteration)
+
+- **Fuse gate kernel into CuTe-DSL `gb_warp`**: Save ~5us/call on 55 CuTe-DSL workloads = 275us mean = **~1.3% improvement**. **Risk**: modifying the 4600-line vendored kernel; prior attempts at CuTe-DSL surgery (stage tuning) were abandoned due to complexity.
+- **Bypass TVM FFI**: Save ~10-15us/call = **~3% improvement**. **Risk**: very high — requires extracting raw CUDA function handle from CuTe-DSL's compiled object, which is not a supported API.
+- **Gate kernel on secondary stream (overlap with D2H)**: Save ~2us on multi-seq calls = **~0.3% improvement**. Low-medium risk but also low value.
+- **Stable ctypes pointer caching for gate kernel args**: Save ~1-2us/call = **~0.5% improvement**. Low risk but micro-optimization.
+
+### Decision for this iteration
+
+Commit profiling infrastructure (`scripts/profile_modal.py`). No kernel code change — the analysis shows the remaining 3% gap to sub-0.2ms is in overhead chunks that are either (a) hard to reduce without high-risk vendored-kernel surgery, or (b) spread across many small sources that would require many micro-optimizations for compound gains. Current state (0.2054ms, -27.2% from original baseline) is a strong result.
+
 ## 2026-04-21 - Minimal inline max_s_q (ACCEPTED, marginal)
 
 - **Idea**: Replace `get_cu_seqlens_metadata(cu_seqlens)` (which caches by id — always misses due to clone-per-iteration — and does dict/weakref bookkeeping and builds a full metadata dict including unused fields) with minimal inline: `cu_seqlens.tolist(); max(h[i+1] - h[i] for i in range(num_seqs))`. Skips weakref creation, dict storage, nondecreasing check, and multi-field dict construction.

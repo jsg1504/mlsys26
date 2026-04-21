@@ -6,6 +6,83 @@ Tracking all optimization iterations for the prefill kernel.
 
 <!-- Append new entries below this line -->
 
+## 2026-04-22 - Warp-Cooperative Sequential Kernel (ACCEPTED — SUB-0.2ms ACHIEVED)
+
+- **Idea**: Distribute the 128 fp32 state values across 4 cooperative threads instead of having each thread hold all 128. Each thread now holds 32 state values (1/4 of the K dimension). kS dot product and output accumulation use `__shfl_xor_sync` butterfly reduction across the 4-thread group. Grid grows 4x (num_seqs*32 vs num_seqs*8) since each block handles 32 V elements instead of 128.
+- **Why this works (and differs from failed 4-way accumulation attempt)**:
+  - Failed attempt #34 (4-way accumulation): split the ACCUMULATOR into 4 chains but each thread still held all 128 state registers → same register pressure, same occupancy
+  - This approach: splits the STATE itself across threads → 32 registers per thread instead of 128 → register pressure drops ~60%, FMA chain drops 4x (32 vs 128), grid parallelism increases 4x
+  - NCU showed 89% scheduler starvation with 4 warps/SM. Shorter FMA chains + lower register pressure allows more warps/SM and better latency hiding
+  - Grid: single-seq now launches 32 blocks (vs 8), utilizing ~32 SMs (vs 8) on B200
+- **Implementation**: 4-thread cooperative groups within each warp. `lane = threadIdx.x % 4` (K-partition), `vid = threadIdx.x / 4` (V-element within quarter). `v_quarter = blockIdx.x % 4`. Butterfly reduction via `__shfl_xor_sync(0xffffffff, val, 1)` + `__shfl_xor_sync(0xffffffff, val, 2)`. v value broadcast from lane 0 via `__shfl_sync`.
+- **Result**: Two runs: 0.1969, 0.1968 = avg **0.1969ms (-3.1% vs 0.2031, -30.1% cumulative)**
+- **Status**: ACCEPTED — **SUB-0.2ms TARGET ACHIEVED**
+- **Correctness**: 100/100 pass, max_atol=0.00909 (unchanged)
+- **Distribution**: 53 fast (<0.1ms, was 48) / 31 medium / 16 slow. Min 0.020ms (was 0.039ms, -49%).
+- **Learning**: When a kernel is latency-bound with scheduler starvation, distributing work across threads via warp shuffles can be more effective than any single-thread optimization. The 128-deep FMA chain was the fundamental bottleneck that no amount of compiler hinting, unroll tuning, or memory optimization could fix. Only an algorithmic restructuring that shortens the chain resolves it.
+
+## 2026-04-21 - Raw cuMemcpyDtoH for multi-seq max_s_q (ACCEPTED)
+
+- **Idea**: Replace PyTorch's `.tolist()` with raw `drv.cuMemcpyDtoH` from `cuda.bindings.driver` for reading cu_seqlens in multi-seq CuTe-DSL workloads. Pre-allocate a ctypes `c_longlong[101]` host buffer at module level, use direct D2H copy to bypass PyTorch tensor allocation + Python list creation overhead.
+- **Implementation**: `_cuMemcpyDtoH(_cu_seqlens_host_ptr, cu_seqlens.data_ptr(), n * 8)` then read from ctypes array `_cu_seqlens_host[i]` directly. No Python list objects created. No temporary CPU tensor allocated.
+- **Result**: Two runs: 0.2032, 0.2030 = avg **0.2031ms (-1.0% vs 0.2054 baseline)**. Baseline re-confirmed at 0.2051ms same session.
+- **Status**: accepted
+- **Correctness**: 100/100 pass, max_atol=0.00909
+- **Distribution**: 48 fast / 36 medium / 16 slow. Min 0.039ms.
+- **Cumulative**: 0.282ms → 0.2031ms (-28.0%)
+- **Why it works**: `cuMemcpyDtoH` is a direct CUDA Driver API call that copies device memory to a pre-allocated host buffer. Avoids: (a) PyTorch C++ dispatch overhead (~1us), (b) temporary CPU tensor allocation (~1-2us), (c) Python list object creation for each element (~2-3us for 35 elements). Total savings: ~5-7us per multi-seq CuTe-DSL call × ~26 calls = ~130-180us → 1.3-1.8us per workload.
+- **Also attempted (REVERTED)**: Fusing max_s_q computation into the fused_gate_kernel (adding cu_seqlens, num_seqs, max_s_q_out parameters). This REGRESSED +6.3% (0.2051→0.2181ms) because modifying the NVRTC kernel source — even adding unused parameters — changed register allocation and compiled code quality. Lesson: avoid modifying NVRTC kernel signatures for micro-optimizations; the recompilation side-effects outweigh the intended gains.
+
+## 2026-04-21 - Pinned D2H + Direct TVM FFI (NEUTRAL, reverted) + B200 Overhead Probe
+
+### Probe: Accurate overhead decomposition on Modal B200
+
+Ran diagnostic probe (`scripts/probe_compiled_gdn.py`) on B200 to measure real per-component dispatch overhead. **Key finding: previous overhead estimates were wrong.**
+
+**compiled_gdn object**: type=`TVMFFIJitCompiledFunctionWithKwargs`, has `_tvm_ffi_function` (raw TVM FFI function), `kernel_info`, `capi_func`. `__cubin__` and `__ptx__` are **None** (CUBIN not extractable from CuTe-DSL compilation). `jit_module` is None. `engine` is `ExecutionEngine` (MLIR JIT, no module extraction API).
+
+**Per-component CPU-side overhead (p50, with cloned tensors)**:
+
+| Component | p50 | Notes |
+|---|---|---|
+| **max_s_q (.tolist() D2H sync)** | **14.0us** | Dominates! D2H + Python conversion |
+| compiled_gdn call | 4.0us | Only ~4us, NOT 15-20us as estimated |
+| gate kernel launch | 2.3us | cuLaunchKernel via pre-allocated ctypes |
+| bundle_get | 0.8us | Dict lookup |
+| gate_setup | 0.6us | ctypes value assignments |
+| **Total CPU dispatch** | **22.3us** | For multi-seq CuTe-DSL path |
+
+**_tvm_ffi_function direct call**: 2.9us p50 vs 3.3-4.0us via kwargs wrapper. Saves ~1us by bypassing Python kwargs resolution. Same results with cloned vs same tensors (no TMA descriptor recreation difference detected).
+
+### Optimization attempt: pinned tensor + direct TVM FFI
+
+- **Idea**: (1) Replace `.tolist()` with pre-allocated pinned tensor `.copy_() + .tolist()` to avoid CPU tensor allocation overhead. (2) Call `compiled_gdn._tvm_ffi_function` directly with positional `stream` arg to save ~1us kwargs overhead.
+- **Expected saving**: 3-5us pinned + 1us direct call = 4-6us per CuTe-DSL call × 52 = 208-312us total → ~1.0-1.5% improvement.
+- **Result**: Two runs: 0.2197, 0.2205 = avg **0.2201ms (+7.2% regression)**, 100/100 pass. Distribution: 46 fast / 37 medium / 17 long (vs 48/35/17 baseline).
+- **Status**: REVERTED — consistent regression across 2 runs, changes actively hurt performance.
+- **Why pinned regressed**: PyTorch's `.copy_()` from CUDA to pinned CPU still triggers `cudaMemcpyAsync` + stream sync (no savings on D2H). The extra slice operations (`[:n+1]` twice) and `.tolist()` on a pinned tensor (which may require intermediate allocation) added measurable overhead. Net effect: slightly SLOWER than direct `.tolist()` on the CUDA tensor.
+- **Why direct TVM FFI call barely helps (or hurts)**: The kwargs wrapper overhead is only ~0.5us in isolation but bypassing it may disable error handling fast-paths inside CuTe-DSL's `TVMFFIJitCompiledFunctionWithKwargs` that have performance implications. The wrapper's positional argument packing was not a bottleneck.
+
+### Corrected overhead model
+
+The previous profiling (entry #40) measured ~50us GPU-timeline overhead per CuTe-DSL call. With the new probe showing ~22us CPU dispatch, the gap (~28us) is GPU-side:
+- Gate kernel GPU execution: ~2us
+- GPU idle while CPU dispatches between gate and CuTe-DSL: ~17us (CPU time between gate_launch return and cuLaunchKernel enqueue)
+- CuTe-DSL kernel launch queue latency: ~3-5us
+- CUDA event recording overhead: ~2-4us
+
+### Conclusion: practical optimization ceiling reached
+
+The remaining CuTe-DSL dispatch overhead is fundamentally limited by:
+1. **D2H sync for max_s_q** (14us): Cannot be eliminated without computing max_s_q on GPU, which requires fusing into the gate kernel + separate sync (net savings ≈ 0).
+2. **compiled_gdn host function** (4us): Already minimal — includes TVM FFI crossing + TMA descriptor creation + cuLaunchKernel.
+3. **GPU launch queue latency** (~5us): Hardware limitation.
+
+Further meaningful improvement requires either:
+- A custom medium-sequence kernel (T=65-512) that replaces CuTe-DSL entirely (eliminates 50us overhead for ~35 workloads)
+- Modifying the vendored CuTe-DSL kernel itself (fuse gates, reduce TMA descriptors)
+- Both are multi-session engineering efforts with uncertain ROI.
+
 ## 2026-04-21 - Gate Kernel First (CPU/GPU overlap attempt — NEUTRAL, reverted)
 
 - **Idea**: Reorder main.py so the fused_gate_kernel launches BEFORE the multi-seq `cu_seqlens.tolist()` D2H sync. Hypothesis: the ~2us gate kernel GPU time would overlap with the ~3-5us D2H CPU-blocking time.

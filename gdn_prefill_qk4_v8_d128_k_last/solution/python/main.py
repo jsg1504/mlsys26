@@ -12,11 +12,9 @@ import cuda.bindings.driver as drv
 try:
     from .nvrtc_loader import compile_and_load
     from .gdn_blackwell import chunk_gated_delta_rule, get_gdn_bundle
-    from .prefill_contract import get_cu_seqlens_metadata
 except ImportError:
     from nvrtc_loader import compile_and_load
     from gdn_blackwell import chunk_gated_delta_rule, get_gdn_bundle
-    from prefill_contract import get_cu_seqlens_metadata
 
 THRESHOLD = 64
 _DEFAULT_SCALE = 128 ** -0.5
@@ -32,6 +30,11 @@ _c_float = ctypes.c_float
 _c_void_p = ctypes.c_void_p
 _addressof = ctypes.addressof
 _cuLaunchKernel = drv.cuLaunchKernel
+_cuMemcpyDtoH = drv.cuMemcpyDtoH
+
+# Pre-allocated host buffer for cu_seqlens D2H (max 101 int64 entries)
+_cu_seqlens_host = (ctypes.c_longlong * 101)()
+_cu_seqlens_host_ptr = _addressof(_cu_seqlens_host)
 
 
 def _get_kernel_dir() -> Path:
@@ -112,7 +115,6 @@ def _get_gate_tensors(T, device):
         return cached
     gate_log = torch.empty(T, 8, dtype=torch.float32, device=device)
     beta = torch.empty(T, 8, dtype=torch.float32, device=device)
-    # Cache data_ptr values alongside tensors (stable for cached tensors)
     tensors = (gate_log, beta, gate_log.unsqueeze(0), beta.unsqueeze(0),
                gate_log.data_ptr(), beta.data_ptr())
     _gate_cache[key] = tensors
@@ -170,7 +172,7 @@ def run(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, scale):
 
         _cuLaunchKernel(
             _kernels["sequential"],
-            num_seqs * 8, 1, 1,
+            num_seqs * 32, 1, 1,
             128, 1, 1,
             0, stream, sa.arr, 0,
         )
@@ -180,7 +182,9 @@ def run(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, scale):
         if num_seqs == 1:
             max_s_q = T
         else:
-            h = cu_seqlens.tolist()
+            n = num_seqs + 1
+            _cuMemcpyDtoH(_cu_seqlens_host_ptr, cu_seqlens.data_ptr(), n * 8)
+            h = _cu_seqlens_host
             max_s_q = max(h[i+1] - h[i] for i in range(num_seqs))
 
         gate_log, beta, gate_log_4d, beta_4d, gate_log_ptr, beta_ptr = _get_gate_tensors(T, q.device)
@@ -203,7 +207,6 @@ def run(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, scale):
 
         path_name = "small" if T <= 1024 and num_seqs <= 8 else "large"
 
-        # Fast path: get cached compiled kernel + output/state tensors directly.
         (compiled_gdn, output, output_state, problem_size, normalized_scale,
          output_3d, output_ptr, output_state_ptr) = get_gdn_bundle(
             q, k, v, gate_log_4d, beta_4d, state, cu_seqlens,

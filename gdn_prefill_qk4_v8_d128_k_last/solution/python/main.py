@@ -16,7 +16,7 @@ except ImportError:
     from nvrtc_loader import compile_and_load
     from gdn_blackwell import chunk_gated_delta_rule, get_gdn_bundle
 
-THRESHOLD = 64
+THRESHOLD = 192
 _DEFAULT_SCALE = 128 ** -0.5
 _kernels = {}
 _cached_stream = None

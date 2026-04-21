@@ -6,6 +6,26 @@ Tracking all optimization iterations for the prefill kernel.
 
 <!-- Append new entries below this line -->
 
+## 2026-04-22 - Threshold Re-Sweep with GS=8 Kernel (ACCEPTED)
+
+- **Idea**: The warp-cooperative GS=8 kernel's per-token cost (~0.5-0.7us) is now fast enough that it beats CuTe-DSL (which has ~50us dispatch overhead) for T well beyond the old threshold of 64. Re-sweep to find the new optimal crossover.
+- **Sweep results**:
+
+| THRESHOLD | Mean (ms) | Δ vs T=64 |
+|-----------|-----------|-----------|
+| 64 | 0.1881 | baseline |
+| 96 | 0.1867 | -0.7% |
+| 128 | 0.1862 | -1.0% |
+| **192** | **0.1860** | **-1.1%** |
+| 256 | 0.1872 | -0.5% (regressing) |
+
+- **Result**: THRESHOLD=192 optimal. Two runs: 0.1856, 0.1863 = avg **0.1860ms (-1.1% vs 0.1881)**
+- **Status**: ACCEPTED
+- **Correctness**: 100/100 pass
+- **Distribution**: 54 fast / 31 medium / 15 slow
+- **Cumulative**: 0.282ms → 0.186ms (-34.0%)
+- **Why T=192 and not T=128**: CuTe-DSL chunk_size=128, so T=129-192 is 2 chunks. The sequential kernel at ~0.5-0.7us/token processes T=192 in ~108-146us, while CuTe-DSL 2-chunk costs ~100-130us + 50us overhead = ~150-180us. Sequential wins up to ~T=200. At T=256 (2 full chunks), CuTe-DSL's chunked WGMMA processing catches up and sequential regresses.
+
 ## 2026-04-22 - GROUP_SIZE=8 Tuning (ACCEPTED)
 
 - **Idea**: Increase cooperative group size from 4→8 threads. Each thread now holds 16 fp32 state values (1/8 of K dimension, was 32). FMA chain halved again: 16 FMAs per reduction (was 32). Butterfly reduction gains a third step (XOR 1,2,4 vs XOR 1,2). Grid doubles to num_seqs*64 (was 32).

@@ -6,6 +6,39 @@ Tracking all optimization iterations for the prefill kernel.
 
 <!-- Append new entries below this line -->
 
+## 2026-04-21 - Detailed NCU + Partial Unroll Experiment (REVERTED)
+
+### Detailed NCU Findings (Workload 80, T=48)
+
+Ran ncu with `--set detailed` for full Memory Workload Analysis, Occupancy, Source Counters, Tile Statistics.
+
+**Memory Workload Analysis**:
+```
+Local Memory Spilling Requests:     76800.00
+Local Memory Spilling Req Overhead: 100.00%   (of mem requests)
+L1/TEX Hit Rate:                    96.43%
+L2 Hit Rate:                        76.00%
+Memory Throughput:                  4.65 GB/s  (VERY LOW)
+Mem Busy:                           1.61%      (memory hw 98% idle)
+Mem Pipes Busy:                     1.04%      (memory pipes 99% idle)
+```
+
+**Key insight**: Although 76,800 register spill requests exist, **96.4% of them hit L1 cache** (not DRAM). Memory subsystem is 99% idle. The "spilling" NCU highlights is an ALLOCATION decision by the compiler, not a bandwidth problem. L1-cached spills cost ~20-30 cycles but that's much less than DRAM-bound spills would.
+
+**Why the kernel is still slow**: Not memory bandwidth (1.04% busy) but **latency hiding failure** — with 4 warps/SM and FMA chains, the scheduler has no eligible warp 89% of the time. The scalar FMA dependency chain (each token's kS accumulator) is the true critical path.
+
+### Experiment: #pragma unroll → #pragma unroll 16
+
+- **Hypothesis**: NCU showed 76,800 spill requests. Reducing unroll factor would limit live-register count and eliminate spilling.
+- **Result**: 0.2054 → **0.2471ms (+20% REGRESSION)**. Min latency 0.039 → 0.062ms (short workloads got MUCH slower). Fast workload count (<0.1ms) dropped from ~48 to 22.
+- **Status**: reverted
+- **Why it failed**:
+  1. L1 hit rate was already 96.4% on spills — the spills weren't costly (stayed in L1).
+  2. Partial unroll introduced **loop control overhead** (counter increment, branch) that wasn't there with full unroll.
+  3. Full unroll enables the compiler to **schedule FMA instructions across the entire loop** with deep pipelining; partial unroll fragments this.
+  4. The compiler's full-unroll + spill-to-L1 strategy is actually optimal for this workload.
+- **Learning**: NCU's "Spilling Requests" metric is misleading without context — at 96% L1 hit rate, spills ARE the compiler's chosen optimization, and they're cheap. The true bottleneck is scheduler starvation (4 warps can't hide FMA-chain latency), which cannot be fixed without algorithmic changes (more parallelism via chunked scan).
+
 ## 2026-04-21 - NCU Hardware Profiling + launch_bounds Experiment (REVERTED)
 
 ### NCU Profiling Findings

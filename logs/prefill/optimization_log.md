@@ -6,6 +6,14 @@ Tracking all optimization iterations for the prefill kernel.
 
 <!-- Append new entries below this line -->
 
+## 2026-04-21 - Gate Kernel First (CPU/GPU overlap attempt — NEUTRAL, reverted)
+
+- **Idea**: Reorder main.py so the fused_gate_kernel launches BEFORE the multi-seq `cu_seqlens.tolist()` D2H sync. Hypothesis: the ~2us gate kernel GPU time would overlap with the ~3-5us D2H CPU-blocking time.
+- **Result**: 0.2054ms → **0.2054ms (0.0%, neutral)**
+- **Status**: reverted (no benefit, kept original order for simplicity)
+- **Why no overlap happened**: `tensor.cpu()` / `tensor.tolist()` issues `cudaMemcpyAsync` on the CURRENT PyTorch CUDA stream — the SAME stream as the gate kernel launch. CUDA streams are strictly ordered — the D2H memcpy queues AFTER the gate kernel and waits for it to complete. No parallel execution between same-stream operations.
+- **Learning**: To actually overlap CPU-blocking D2H with GPU compute, the D2H and the GPU work must be on DIFFERENT streams. But creating a secondary stream context in Python adds ~2-3us overhead per call, likely exceeding the 2us gate kernel time we'd overlap. Net: not worth pursuing. The stream-serialization property means Python-level reordering around `.cpu()` has no effect on GPU timeline — it only affects CPU timeline.
+
 ## 2026-04-21 - Detailed NCU + Partial Unroll Experiment (REVERTED)
 
 ### Detailed NCU Findings (Workload 80, T=48)

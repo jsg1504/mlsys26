@@ -199,17 +199,11 @@ def run_ncu_profiling(solution_json: str, definition_name: str, workload_indices
                 # Filter to our kernels only (not Activity Buffer etc)
                 ncu_cmd = [
                     ncu_bin,
-                    "--section", "SpeedOfLight",
-                    "--section", "LaunchStats",
-                    "--section", "Occupancy",
-                    "--section", "SchedulerStats",
-                    "--section", "WarpStateStats",
-                    "--section", "MemoryWorkloadAnalysis",
+                    "--set", "detailed",
                     "--kernel-name", "regex:gdn_prefill_sequential|fused_gate_kernel|kernel_cutlass",
                     "--profile-from-start", "off",
                     "--target-processes", "all",
                     "--print-summary", "per-kernel",
-                    "--csv",
                     "python3", script_path,
                 ]
                 result = subprocess.run(
@@ -220,11 +214,11 @@ def run_ncu_profiling(solution_json: str, definition_name: str, workload_indices
                     env={**os.environ, "CUDA_VISIBLE_DEVICES": "0"},
                 )
                 if result.returncode == 0:
-                    output_lines.append(result.stdout[-3000:] if len(result.stdout) > 3000 else result.stdout)
+                    output_lines.append(result.stdout[-5000:] if len(result.stdout) > 5000 else result.stdout)
                 else:
                     output_lines.append(f"  ncu failed (rc={result.returncode})")
-                    output_lines.append(f"  stderr: {result.stderr[:500]}")
-                    output_lines.append(f"  stdout: {result.stdout[:500]}")
+                    output_lines.append(f"  stderr: {result.stderr[:1000]}")
+                    output_lines.append(f"  stdout: {result.stdout[:1000]}")
             except subprocess.TimeoutExpired:
                 output_lines.append("  ncu timed out (300s)")
             except Exception as e:

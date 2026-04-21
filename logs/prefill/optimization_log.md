@@ -6,6 +6,17 @@ Tracking all optimization iterations for the prefill kernel.
 
 <!-- Append new entries below this line -->
 
+## 2026-04-22 - GROUP_SIZE=8 Tuning (ACCEPTED)
+
+- **Idea**: Increase cooperative group size from 4→8 threads. Each thread now holds 16 fp32 state values (1/8 of K dimension, was 32). FMA chain halved again: 16 FMAs per reduction (was 32). Butterfly reduction gains a third step (XOR 1,2,4 vs XOR 1,2). Grid doubles to num_seqs*64 (was 32).
+- **Implementation**: Change constants (GROUP_SIZE=8, K_PER_THREAD=16, V_PER_BLOCK=16, V_QUARTERS=8), add `__shfl_xor_sync(..., 4)` to both kS and output butterfly reductions, update v broadcast mask from `~3` to `~7`, grid from `num_seqs*32` to `num_seqs*64`.
+- **Result**: Two runs: 0.1881, 0.1880 = avg **0.1881ms (-4.5% vs 0.1969)**
+- **Status**: ACCEPTED
+- **Correctness**: 100/100 pass, max_atol=0.00909 (unchanged)
+- **Distribution**: 53 fast / 32 medium / 15 slow. Min 0.016ms (was 0.020ms, -20%).
+- **Cumulative**: 0.282ms → 0.1881ms (-33.3%)
+- **Why it works**: The same three mechanisms from GROUP_SIZE=4 but stronger: (1) FMA chain 16 vs 32 (half the critical path), (2) 16 state registers vs 32 (even less pressure), (3) 64 blocks vs 32 for single-seq (40% SM utilization vs 20%). The extra shuffle step (3 vs 2) costs ~8 cycles per token but is overwhelmed by the ~64-cycle FMA chain reduction.
+
 ## 2026-04-22 - Warp-Cooperative Sequential Kernel (ACCEPTED — SUB-0.2ms ACHIEVED)
 
 - **Idea**: Distribute the 128 fp32 state values across 4 cooperative threads instead of having each thread hold all 128. Each thread now holds 32 state values (1/4 of the K dimension). kS dot product and output accumulation use `__shfl_xor_sync` butterfly reduction across the 4-thread group. Grid grows 4x (num_seqs*32 vs num_seqs*8) since each block handles 32 V elements instead of 128.

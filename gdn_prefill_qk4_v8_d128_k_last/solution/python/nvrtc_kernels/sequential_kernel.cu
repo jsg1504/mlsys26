@@ -1,15 +1,15 @@
 /*
- * Warp-cooperative GDN prefill with 4-thread groups.
- * Grid: num_seqs * 8 * 4 blocks (seq, v_head, v_quarter).
- * 128 threads per block, each group of 4 threads cooperates on 1 V element.
- * Each thread owns 32 fp32 state values (1/4 of the K dimension).
+ * Warp-cooperative GDN prefill with 8-thread groups.
+ * Grid: num_seqs * 8 * 8 blocks (seq, v_head, v_eighth).
+ * 128 threads per block, each group of 8 threads cooperates on 1 V element.
+ * Each thread owns 16 fp32 state values (1/8 of the K dimension).
  *
- * Per-token: 32 FMAs for kS partial + shuffle reduce + 32 FMAs for state+output
- *            + shuffle reduce for output = ~64 FMAs + 2 butterfly reductions.
+ * Per-token: 16 FMAs for kS partial + shuffle reduce + 16 FMAs for state+output
+ *            + shuffle reduce for output = ~32 FMAs + 2 butterfly reductions.
  *
- * kS and output reductions use __shfl_xor_sync with deltas 1,2 within
- * groups of 4 consecutive threads. XOR by 1 flips bit 0, XOR by 2 flips
- * bit 1 — both stay within groups of 4, so full-warp mask 0xffffffff is safe.
+ * kS and output reductions use __shfl_xor_sync with deltas 1,2,4 within
+ * groups of 8 consecutive threads. XOR by 1/2/4 flips bits 0/1/2
+ * — all stay within groups of 8, so full-warp mask 0xffffffff is safe.
  *
  * Compiled via NVRTC — no TVM/torch dependencies.
  */
@@ -38,10 +38,10 @@ constexpr int NUM_K_HEADS = 4;
 constexpr int NUM_V_HEADS = 8;
 constexpr int HEAD_DIM = 128;
 constexpr int V_PER_Q = 2;
-constexpr int GROUP_SIZE = 4;
-constexpr int K_PER_THREAD = HEAD_DIM / GROUP_SIZE;  // 32
-constexpr int V_PER_BLOCK = 128 / GROUP_SIZE;        // 32
-constexpr int V_QUARTERS = HEAD_DIM / V_PER_BLOCK;   // 4
+constexpr int GROUP_SIZE = 8;
+constexpr int K_PER_THREAD = HEAD_DIM / GROUP_SIZE;  // 16
+constexpr int V_PER_BLOCK = 128 / GROUP_SIZE;        // 16
+constexpr int V_QUARTERS = HEAD_DIM / V_PER_BLOCK;   // 8
 
 extern "C"
 __launch_bounds__(128, 1)
@@ -68,8 +68,8 @@ __global__ void gdn_prefill_sequential(
     const int qkh = vh / V_PER_Q;
 
     // Thread indexing within block
-    const int lane = threadIdx.x % GROUP_SIZE;     // 0-3 within group
-    const int vid = threadIdx.x / GROUP_SIZE;      // 0-31, V index within this quarter
+    const int lane = threadIdx.x % GROUP_SIZE;     // 0-7 within group
+    const int vid = threadIdx.x / GROUP_SIZE;      // 0-15, V index within this eighth
     const int actual_vid = v_quarter * V_PER_BLOCK + vid;  // 0-127, global V index
 
     if (seq >= num_seqs) return;
@@ -79,7 +79,7 @@ __global__ void gdn_prefill_sequential(
     const int seq_len = (int)(seq_end - seq_start);
     if (seq_len <= 0) return;
 
-    // Load state: each thread loads 32 values from its K-dimension partition
+    // Load state: each thread loads 16 values from its K-dimension partition
     const float* state_base = state + ((long long)seq * NUM_V_HEADS + vh) * HEAD_DIM * HEAD_DIM;
     float s[K_PER_THREAD];
     #pragma unroll
@@ -115,9 +115,10 @@ __global__ void gdn_prefill_sequential(
             );
         }
 
-        // Butterfly reduce across 4 lanes (XOR 1,2 stays within groups of 4)
+        // Butterfly reduce across 8 lanes (XOR 1,2,4 stays within groups of 8)
         partial_kS += __shfl_xor_sync(0xffffffff, partial_kS, 1);
         partial_kS += __shfl_xor_sync(0xffffffff, partial_kS, 2);
+        partial_kS += __shfl_xor_sync(0xffffffff, partial_kS, 4);
         float kS = partial_kS * g;
 
         // 2. Read v and broadcast from lane 0 to all lanes in the group
@@ -125,7 +126,7 @@ __global__ void gdn_prefill_sequential(
         if (lane == 0) {
             v_val = bf16_to_float(v_ptr[t * NUM_V_HEADS * HEAD_DIM + vh * HEAD_DIM + actual_vid]);
         }
-        v_val = __shfl_sync(0xffffffff, v_val, (threadIdx.x & ~3));  // broadcast from lane 0 of this group
+        v_val = __shfl_sync(0xffffffff, v_val, (threadIdx.x & ~7));  // broadcast from lane 0 of this group
 
         float residual = beta_val * (v_val - kS);
 
@@ -143,9 +144,10 @@ __global__ void gdn_prefill_sequential(
             );
         }
 
-        // 4. Output reduction (butterfly across 4 lanes)
+        // 4. Output reduction (butterfly across 8 lanes)
         partial_out += __shfl_xor_sync(0xffffffff, partial_out, 1);
         partial_out += __shfl_xor_sync(0xffffffff, partial_out, 2);
+        partial_out += __shfl_xor_sync(0xffffffff, partial_out, 4);
 
         // Only lane 0 writes the output for this V element
         if (lane == 0) {

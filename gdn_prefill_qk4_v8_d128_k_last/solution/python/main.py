@@ -172,7 +172,7 @@ def run(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, scale):
 
         _cuLaunchKernel(
             _kernels["sequential"],
-            num_seqs * 32, 1, 1,
+            num_seqs * 64, 1, 1,
             128, 1, 1,
             0, stream, sa.arr, 0,
         )

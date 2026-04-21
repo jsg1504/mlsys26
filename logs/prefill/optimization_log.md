@@ -6,6 +6,31 @@ Tracking all optimization iterations for the prefill kernel.
 
 <!-- Append new entries below this line -->
 
+## 2026-04-21 - Minimal inline max_s_q (ACCEPTED, marginal)
+
+- **Idea**: Replace `get_cu_seqlens_metadata(cu_seqlens)` (which caches by id — always misses due to clone-per-iteration — and does dict/weakref bookkeeping and builds a full metadata dict including unused fields) with minimal inline: `cu_seqlens.tolist(); max(h[i+1] - h[i] for i in range(num_seqs))`. Skips weakref creation, dict storage, nondecreasing check, and multi-field dict construction.
+- **Result**: 0.2064ms → **0.2054ms (-0.5%)** (mean of 2 runs: 0.2057, 0.2051)
+- **Status**: accepted
+- **Correctness**: 100/100 pass
+- **Cumulative**: 0.282ms → 0.2054ms (-27.2%)
+- **Learning**: For a function called in the hot path, the Python-side overhead of dict lookup + weakref creation + closure + multi-field dict construction is meaningful (~3-6us). When the cache is known to always miss (clone-per-iteration harness pattern), the caching infrastructure is pure overhead. This is a micro-optimization but clean and safe.
+
+## 2026-04-21 - max_s_q=T upper-bound shortcut (REVERTED — major regression)
+
+- **Idea**: Use `max_s_q = T` for ALL workloads (including multi-seq). T is always a safe upper bound on per-sequence length. Eliminates ALL GPU→CPU syncs.
+- **Result**: 0.2064ms → **0.4076ms (+97% MAJOR REGRESSION)**. Max latency 0.86ms → 2.80ms.
+- **Status**: reverted
+- **Root cause**: CuTe-DSL kernel is very sensitive to `max_s_q`. The tile scheduler allocates `ceil(max_s_q / chunk_size)` tiles per sequence. For multi-seq workloads with T >> max_s_q (e.g., T=500, num_seqs=10, actual max_s_q=50), using `max_s_q=T=500` inflates tiles per seq from 1 to 4, producing 3 extra empty tiles per sequence. Each empty tile still goes through the tile-scheduler pipeline (bounds check, mbarrier sync, early exit), costing ~5-10us per empty tile. Aggregated across all tiles: ~200ms of extra scheduling work on the most affected workloads.
+- **Learning**: The CuTe-DSL persistent tile scheduler is NOT free per tile — empty tiles still have significant setup overhead. Any overestimate of `max_s_q` directly multiplies the tile count and measurably hurts performance. The "safe overestimate" approach cannot be used here.
+
+## 2026-04-21 - Inline (cu_seqlens[1:] - cu_seqlens[:-1]).max() (REVERTED)
+
+- **Idea**: Replace `get_cu_seqlens_metadata` with `int((cu_seqlens[1:] - cu_seqlens[:-1]).max())`. Compute diff+max on GPU, sync only 1 element.
+- **Result**: 0.2064ms → **0.2313ms (+12% REGRESSION)**
+- **Status**: reverted
+- **Root cause**: The subtract and max operations each launch a GPU kernel. Kernel launch overhead on Blackwell is ~5-8us per kernel. Two extra kernel launches = ~10-16us overhead per call, much more than the D2H sync cost (~5us) of `.cpu()` on a small tensor. The original `.cpu().tolist()` does a SINGLE fast D2H transfer followed by pure-CPU computation.
+- **Learning**: For small tensors, `.cpu().tolist()` is faster than multi-op GPU reductions because the D2H latency dominates small-tensor transfers anyway, and CPU-side Python arithmetic on a small list is faster than launching two GPU kernels. Kernel launch overhead matters for these micro-operations.
+
 ## 2026-04-21 - Single-seq max_s_q shortcut (ACCEPTED)
 
 - **Idea**: When `num_seqs == 1`, `max_s_q == T` exactly. Skip the `get_cu_seqlens_metadata` call entirely (which does `.detach().cpu().tolist()` — a GPU→CPU sync) and use `max_s_q = T` directly.

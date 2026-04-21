@@ -180,8 +180,8 @@ def run(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, scale):
         if num_seqs == 1:
             max_s_q = T
         else:
-            meta = get_cu_seqlens_metadata(cu_seqlens)
-            max_s_q = meta["max_s_q"]
+            h = cu_seqlens.tolist()
+            max_s_q = max(h[i+1] - h[i] for i in range(num_seqs))
 
         gate_log, beta, gate_log_4d, beta_4d, gate_log_ptr, beta_ptr = _get_gate_tensors(T, q.device)
 

@@ -6,6 +6,36 @@ Tracking all optimization iterations for the prefill kernel.
 
 <!-- Append new entries below this line -->
 
+## 2026-04-21 - NCU Hardware Profiling + launch_bounds Experiment (REVERTED)
+
+### NCU Profiling Findings
+
+Ran actual `ncu` (NVIDIA Nsight Compute) on Modal B200 via `scripts/ncu_profile_modal.py` (sections: SpeedOfLight, LaunchStats, Occupancy, SchedulerStats, WarpStateStats, MemoryWorkloadAnalysis, CSV output).
+
+For `gdn_prefill_sequential` (our kernel):
+
+| Metric | Workload 0 (T=6) | Workload 80 (T=48) |
+|---|---|---|
+| Block Limit Registers | 2.00 | 2.00 |
+| Theoretical Active Warps/SM | 8 | 8 |
+| Theoretical Occupancy | 12.50% | 12.50% |
+| **Achieved Occupancy** | **6.21%** | **6.28%** |
+| One or More Eligible | 10.37% | 18.17% |
+| **No Eligible** | **89.63%** | **81.83%** |
+| Active Warps/Scheduler | 1.00 | 1.00 |
+| Eligible Warps/Scheduler | 0.10 | 0.18 |
+| Warp Cycles/Issued Instruction | 9.65 | 5.50 |
+
+**Diagnosis**: Kernel is **latency-bound** with **severely low achieved occupancy (6.2%)**. 89% of scheduler cycles have no eligible warp to issue. Only 4 warps/SM active.
+
+### Experiment: __launch_bounds__(128, 1) → (128, 2)
+
+- **Hypothesis**: Block Limit Registers = 2 means current register usage already permits 2 blocks/SM. Changing launch_bounds from (128,1) to (128,2) lets the grid scheduler pack 2 blocks/SM → 8 warps/SM → better latency hiding.
+- **Result**: 0.2054 → **0.2192ms (+6.7%)** (though this may be partially Modal GPU noise — a repeat revert run measured 0.2177)
+- **Status**: reverted
+- **Root cause of no-help**: The critical constraint is the TOTAL number of blocks, not per-SM packing. For single-seq workloads we launch only `1 * 8 = 8 blocks`. Packing 2 blocks/SM would use just 4 SMs instead of 8 — fewer SMs doing more work serially. The "low occupancy" NCU flagged is a symptom of insufficient grid parallelism for the workload (single sequence, sequential recurrence in time), not something fixable by register/occupancy tuning.
+- **Learning**: NCU's "Block Limit Registers = 2" implied we had 2x room on each SM, but with only 8 blocks in the grid we CANNOT benefit from allowing multiple per SM — doing so just concentrates work on fewer SMs. To actually improve parallelism would require algorithmic changes (chunked parallel scan splitting the time dimension), which is a much larger rewrite.
+
 ## 2026-04-21 - Modal B200 Profiling Analysis (no code change)
 
 Profiled 8 representative workloads on Modal B200 using torch.profiler + CUDA events. Script: `scripts/profile_modal.py`.

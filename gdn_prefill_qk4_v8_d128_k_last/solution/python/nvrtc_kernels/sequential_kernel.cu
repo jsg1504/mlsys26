@@ -38,10 +38,10 @@ constexpr int NUM_K_HEADS = 4;
 constexpr int NUM_V_HEADS = 8;
 constexpr int HEAD_DIM = 128;
 constexpr int V_PER_Q = 2;
-constexpr int GROUP_SIZE = 8;
-constexpr int K_PER_THREAD = HEAD_DIM / GROUP_SIZE;  // 16
-constexpr int V_PER_BLOCK = 128 / GROUP_SIZE;        // 16
-constexpr int V_QUARTERS = HEAD_DIM / V_PER_BLOCK;   // 8
+constexpr int GROUP_SIZE = 16;
+constexpr int K_PER_THREAD = HEAD_DIM / GROUP_SIZE;  // 8
+constexpr int V_PER_BLOCK = 128 / GROUP_SIZE;        // 8
+constexpr int V_QUARTERS = HEAD_DIM / V_PER_BLOCK;   // 16
 
 extern "C"
 __launch_bounds__(128, 1)
@@ -115,10 +115,11 @@ __global__ void gdn_prefill_sequential(
             );
         }
 
-        // Butterfly reduce across 8 lanes (XOR 1,2,4 stays within groups of 8)
+        // Butterfly reduce across 16 lanes (XOR 1,2,4,8 stays within groups of 16)
         partial_kS += __shfl_xor_sync(0xffffffff, partial_kS, 1);
         partial_kS += __shfl_xor_sync(0xffffffff, partial_kS, 2);
         partial_kS += __shfl_xor_sync(0xffffffff, partial_kS, 4);
+        partial_kS += __shfl_xor_sync(0xffffffff, partial_kS, 8);
         float kS = partial_kS * g;
 
         // 2. Read v and broadcast from lane 0 to all lanes in the group
@@ -126,7 +127,7 @@ __global__ void gdn_prefill_sequential(
         if (lane == 0) {
             v_val = bf16_to_float(v_ptr[t * NUM_V_HEADS * HEAD_DIM + vh * HEAD_DIM + actual_vid]);
         }
-        v_val = __shfl_sync(0xffffffff, v_val, (threadIdx.x & ~7));  // broadcast from lane 0 of this group
+        v_val = __shfl_sync(0xffffffff, v_val, (threadIdx.x & ~15));  // broadcast from lane 0 of this group
 
         float residual = beta_val * (v_val - kS);
 
@@ -144,10 +145,11 @@ __global__ void gdn_prefill_sequential(
             );
         }
 
-        // 4. Output reduction (butterfly across 8 lanes)
+        // 4. Output reduction (butterfly across 16 lanes)
         partial_out += __shfl_xor_sync(0xffffffff, partial_out, 1);
         partial_out += __shfl_xor_sync(0xffffffff, partial_out, 2);
         partial_out += __shfl_xor_sync(0xffffffff, partial_out, 4);
+        partial_out += __shfl_xor_sync(0xffffffff, partial_out, 8);
 
         // Only lane 0 writes the output for this V element
         if (lane == 0) {

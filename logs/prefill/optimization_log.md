@@ -6,6 +6,17 @@ Tracking all optimization iterations for the prefill kernel.
 
 <!-- Append new entries below this line -->
 
+## 2026-04-22 - GROUP_SIZE=16 Tuning (ACCEPTED, marginal)
+
+- **Idea**: Increase cooperative group size from 8→16 threads. Each thread now holds 8 fp32 state values (1/16 of K dimension, was 16). FMA chain halved again: 8 FMAs per reduction (was 16). Butterfly reduction gains a 4th step (XOR 1,2,4,8 vs XOR 1,2,4). Grid doubles to num_seqs*128 (was 64). 76% SM utilization for single-seq on B200 (was 38%).
+- **Result**: Mean **0.1847ms (-0.7% vs 0.186)**. 100/100 pass, max_atol=0.00827 (unchanged).
+- **Threshold re-sweep**: T=256 → 0.1858ms (regression from T=192). Crossover point did not shift — T=192 remains optimal.
+- **Status**: ACCEPTED (marginal improvement, no regression)
+- **Correctness**: 100/100 pass
+- **Cumulative**: 0.282ms → 0.1847ms (-34.5%)
+- **Why only -0.7% (vs -4.5% for GS=4→8)**: Diminishing returns on cooperative scaling. At GS=16, the 4 shuffle steps (~32 cycles) are a significant fraction of the 8-FMA chain (~32 cycles). The ratio of useful FMA work to shuffle overhead shifted from 16:24 (GS=8) to 8:32 (GS=16). Additionally, the token loop is no longer the dominant cost for short sequences — kernel launch overhead, state load/store, and Python dispatch dominate.
+- **GS=32 analysis**: Would yield only 4 state values/thread with 5 shuffle steps. Expected to regress — not attempted.
+
 ## 2026-04-22 - Threshold Re-Sweep with GS=8 Kernel (ACCEPTED)
 
 - **Idea**: The warp-cooperative GS=8 kernel's per-token cost (~0.5-0.7us) is now fast enough that it beats CuTe-DSL (which has ~50us dispatch overhead) for T well beyond the old threshold of 64. Re-sweep to find the new optimal crossover.

@@ -6,6 +6,76 @@ Tracking all optimization iterations for the prefill kernel.
 
 <!-- Append new entries below this line -->
 
+## 2026-04-22 - Python Dispatch Overhead Reduction v2 (ACCEPTED, marginal)
+
+- **Idea**: Comprehensive Python dispatch overhead reduction targeting the ~8.5% of mean latency spent in Python interpreter overhead. Changes: (1) unbound `_data_ptr = torch.Tensor.data_ptr` — avoids per-call attribute lookup + bound method creation for 20 `.data_ptr()` calls per iteration, (2) inlined 4 helper functions (`_ensure_kernels`, `_get_stream`, `_get_seq_output`, `_get_seq_state`, `_get_gate_tensors`) to eliminate function call frame overhead, (3) simplified cache keys from `(T, device)` → `T`, `(tuple(shape), dtype, device)` → `num_seqs` (eliminates tuple creation + complex hashing), (4) cached `data_ptr()` for output/new_state/gate_log/beta in cache entries (skip 2-6 method calls per iteration).
+- **Result**: 0.1847ms → **0.1837ms (-0.5%)**. 100/100 pass, correctness unchanged (max_atol=0.00827).
+- **Status**: ACCEPTED (marginal improvement, code simplification)
+- **Correctness**: 100/100 pass
+- **Cumulative**: 0.282ms → 0.1837ms (-34.9%)
+- **Why marginal and not the estimated 2.7%**: (1) CPython's method resolution for `.data_ptr()` is faster than estimated (~100-200ns, not 300ns) due to PyTorch's C extension fast-path for simple property methods, (2) The inlined code has slightly more bytecodes in the `run()` function body (longer local variable scope), partially offsetting the function call savings, (3) The `_get_stream()` overhead was already ~0.1us (a single global check), not the estimated ~0.5us. The actual per-call savings is ~1us, not ~5us.
+- **Why accepted despite being marginal**: The code changes are a net simplification (4 fewer function definitions, simpler cache keys, fewer intermediate objects). All previous "neutral" attempts measured +0.3% to +0.5% above baseline; this is the first sub-baseline result, suggesting a real (if small) improvement masked by noise.
+
+## 2026-04-22 - PTX Software Prefetch (NEUTRAL, reverted)
+
+- **Idea**: Issue PTX `prefetch.global.L1` instructions at the start of each token iteration to hide L1 miss latency. Two prefetches: (1) next token's k data (`k[t+1]`) to warm L1 for the next iteration's pass 1, (2) current token's q data (`q[t]`) to warm L1 for this iteration's pass 2 (q is read ~50-100 instructions later). Each lane prefetches its own K-partition slice. The stride between consecutive tokens' k/q data is 1024 bytes (8 cache lines apart), so no hardware prefetching occurs — every token is a cold L1 miss.
+- **Result**: 0.1847ms → **0.1852ms (+0.3%, noise)**. 100/100 pass.
+- **Status**: REVERTED
+- **Why it didn't help**: The NCU data showed 96.43% L1 hit rate. With `__ldg()` (read-only/texture cache) on the unified L1, the hardware already handles data caching efficiently. The cold miss per token (~32 cycles) is a SINGLE miss on 1 cache line that broadcasts to all 128 threads. The prefetch saves at most ~28 cycles per miss × 2 cache line sets (k and q) = ~56 cycles per token. But with 89% scheduler starvation, these 56 saved cycles are a fraction of the ~200 idle cycles per token — the scheduler can't issue instructions any faster because the bottleneck is the FMA dependency chain, not load latency.
+- **Learning**: Software prefetch helps when load latency is on the critical path AND the scheduler has other work to do while waiting. In our case, the 89% scheduler starvation means the pipeline is idle due to the serial FMA dependency chain, not due to load latency. Even with perfect prefetch (zero-cycle loads), the FMA chain still dominates the critical path. The sequential kernel's performance is compute-latency bound (FMA chain depth), not memory-latency bound.
+
+### Sequential Kernel Optimization Ceiling Summary (7 failed attempts)
+
+| Attempt | Category | Result | Root Cause |
+|---------|----------|--------|------------|
+| k-cache registers | Memory | Neutral | L1 broadcast handles implicit caching |
+| THRESHOLD=384 | Dispatch | Neutral | Per-token cost matches CuTe-DSL at T>192 |
+| Gate shmem precompute | Compute | +4.3% regression | __syncthreads + shmem reads worse than SFU overlap |
+| PTX prefetch | Memory | Neutral | L1 hit rate already 96%, load latency not on critical path |
+| 4-way accumulation | Compute | +7.5% regression | Compiler already breaks FMA chains |
+| Partial unroll | Compute | +20% regression | Breaks compiler's deep instruction pipelining |
+| launch_bounds(128,2) | Occupancy | +6.7% regression | Grid too small for 2 blocks/SM |
+
+The sequential kernel at GS=16 is at a **hard optimization ceiling**. The fundamental bottleneck is the serial token recurrence: each token's state update depends on the previous token's state, creating an irreducible FMA dependency chain of depth 8 (at GS=16) + 4 shuffle steps = ~12 sequential operations per token. No micro-optimization (memory, compute, scheduling) can break this chain. Only algorithmic restructuring (parallel scan, chunked WY decomposition) could help, but these require significant multi-session engineering.
+
+## 2026-04-22 - Gate Pre-computation in Shared Memory (REVERTED — regression)
+
+- **Idea**: All 128 threads in the sequential kernel redundantly compute the same gate values (g, beta) per token — 4 SFU operations × 128 threads = 512 wasted transcendental ops per token. Pre-compute gates cooperatively into `__shared__ float s_gate[192], s_beta[192]` before the main loop (128 threads each handle ~1.5 tokens), then read from shared memory in the hot loop (2 shmem reads instead of 4 SFU ops).
+- **Result**: 0.1847ms → **0.1927ms (+4.3% REGRESSION)**. 100/100 pass, correctness unchanged.
+- **Status**: REVERTED
+- **Why it regressed**:
+  1. The `__syncthreads()` barrier between pre-computation and main loop adds ~20-30 cycles of warp synchronization latency.
+  2. Shared memory reads in the hot loop compete with the compiler's register allocation — the inline gate computation kept `g` and `beta_val` in registers immediately, while shmem reads add load latency (~20 cycles for shmem bank broadcast).
+  3. On Blackwell, SFU operations (expf, log1pf) are well-pipelined and execute concurrently with FMA chains via the hardware scheduler. The SFU computations were NOT on the critical path — they overlapped with the kS FMA chain. Removing them didn't shorten the critical path.
+  4. The pre-computation phase adds ~2 iterations of loop overhead + 1 barrier before ANY useful work starts, penalizing short sequences (T<128) disproportionately.
+- **Learning**: When the hardware scheduler already interleaves SFU and FMA operations effectively, trading SFU compute for shared memory reads + synchronization barriers is a net loss. SFU throughput is not the bottleneck (scheduler starvation at 89% is), so reducing SFU usage provides no benefit. This confirms the sequential kernel's per-token critical path is dominated by the FMA dependency chain + shuffle reductions, not transcendental math.
+
+## 2026-04-22 - Register k-cache + THRESHOLD=384 (BOTH NEUTRAL, reverted)
+
+Two optimization attempts; both produced noise-level results and were reverted.
+
+### Attempt 1: Cache k values in registers (NEUTRAL)
+- **Idea**: The sequential kernel reads k_token from global memory twice per token — once for kS dot product (pass 1) and once for state update (pass 2). Cache the 8 k values in a `float k_cache[K_PER_THREAD]` array during pass 1 and reuse in pass 2, eliminating 8 redundant `__ldg()` loads per token.
+- **Result**: 0.1847ms → **0.1852ms (+0.3%, noise)**. 100/100 pass.
+- **Status**: REVERTED
+- **Why it didn't help**: At GS=16 with K_PER_THREAD=8, the two `__ldg` reads of the same k values are separated by only ~30 instructions (the shuffle reduction). The compiler implicitly keeps the loaded values available — L1 cache serves the second read with near-zero effective latency. The 8 extra explicit register variables offered no benefit over the compiler's implicit register allocation.
+- **Learning**: When L1 hit rate is 96%+ and the two reads are close together in the instruction stream, explicit register caching is redundant with the hardware cache and compiler optimizations. The NCU-identified 89% scheduler starvation is the true bottleneck, not memory load latency.
+
+### Attempt 2: THRESHOLD=192→384 (NEUTRAL)
+- **Idea**: With GS=16's lower per-token cost, the sequential kernel should beat CuTe-DSL for longer sequences by avoiding the ~50us CuTe-DSL dispatch overhead. Extending THRESHOLD to 384 would route T=193-384 workloads through the faster sequential path.
+- **Result**: 0.1847ms → **0.1856ms (+0.5%, noise)**. 100/100 pass.
+- **Status**: REVERTED to THRESHOLD=192
+- **Why it didn't help**: The sequential kernel's per-token cost at T=193-384 roughly matches CuTe-DSL's amortized per-chunk cost + overhead. CuTe-DSL chunk_size=128 processes T=384 in 3 chunks (~150us GPU + ~50us overhead = ~200us). Sequential at ~0.5us/token processes T=384 in ~192us + ~15us overhead = ~207us. The two paths are tied in this range, so the threshold change produces noise-level results.
+- **Additional factor**: The workload distribution has relatively few workloads in the T=193-384 range, limiting the potential impact even if the sequential kernel were marginally faster.
+
+### Optimization ceiling analysis
+Both attempts confirm the prefill kernel is approaching its optimization ceiling at **0.1847ms (34.5% improvement from 0.282ms baseline)**. The remaining breakdown:
+- **Sequential kernel** (T≤192, ~53 workloads): Near optimal. FMA chains, shuffles, and kernel launch overhead are all at minimum for the warp-cooperative design. Register caching, threshold tuning, and load optimization show no further gains.
+- **CuTe-DSL kernel** (T>192, ~47 workloads): The 16 slowest workloads (>0.5ms, kernel-compute dominated) contribute ~52% of total time. Cannot be improved without modifying the vendored 4600-line CuTe-DSL kernel (fuse gates into gb_warp, tune pipeline stages, or implement cluster cooperation).
+- **Python dispatch**: At hardware floor (~22us for CuTe-DSL, ~10us for sequential). A C extension could save ~5-7% but requires high engineering effort.
+
+Further improvement requires either: (1) CuTe-DSL kernel surgery (medium risk, ~2-3% potential), (2) C extension for dispatch (high effort, ~5-7% potential), or (3) custom chunked CUDA kernel for medium sequences (very high effort, uncertain ROI).
+
 ## 2026-04-22 - GROUP_SIZE=16 Tuning (ACCEPTED, marginal)
 
 - **Idea**: Increase cooperative group size from 8→16 threads. Each thread now holds 8 fp32 state values (1/16 of K dimension, was 16). FMA chain halved again: 8 FMAs per reduction (was 16). Butterfly reduction gains a 4th step (XOR 1,2,4,8 vs XOR 1,2,4). Grid doubles to num_seqs*128 (was 64). 76% SM utilization for single-seq on B200 (was 38%).

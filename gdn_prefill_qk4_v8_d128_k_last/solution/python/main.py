@@ -32,6 +32,9 @@ _addressof = ctypes.addressof
 _cuLaunchKernel = drv.cuLaunchKernel
 _cuMemcpyDtoH = drv.cuMemcpyDtoH
 
+# Unbound data_ptr — avoids per-call attribute lookup + bound method creation
+_data_ptr = torch.Tensor.data_ptr
+
 # Pre-allocated host buffer for cu_seqlens D2H (max 101 int64 entries)
 _cu_seqlens_host = (ctypes.c_longlong * 101)()
 _cu_seqlens_host_ptr = _addressof(_cu_seqlens_host)
@@ -39,25 +42,6 @@ _cu_seqlens_host_ptr = _addressof(_cu_seqlens_host)
 
 def _get_kernel_dir() -> Path:
     return Path(__file__).parent / "nvrtc_kernels"
-
-
-def _ensure_kernels():
-    if _kernels:
-        return
-    kdir = _get_kernel_dir()
-    seq_src = (kdir / "sequential_kernel.cu").read_text()
-    seq_fns = compile_and_load(seq_src, ["gdn_prefill_sequential"])
-    _kernels["sequential"] = seq_fns["gdn_prefill_sequential"]
-    gate_src = (kdir / "fused_gate_kernel.cu").read_text()
-    gate_fns = compile_and_load(gate_src, ["fused_gate_kernel"])
-    _kernels["fused_gate"] = gate_fns["fused_gate_kernel"]
-
-
-def _get_stream():
-    global _cached_stream
-    if _cached_stream is None:
-        _cached_stream = drv.CUstream(torch.cuda.current_stream().cuda_stream)
-    return _cached_stream
 
 
 # Pre-allocated ctypes args for sequential kernel (13 params)
@@ -108,66 +92,59 @@ class _GateArgs:
 _gate_args = _GateArgs()
 
 
-def _get_gate_tensors(T, device):
-    key = (T, device)
-    cached = _gate_cache.get(key)
-    if cached is not None:
-        return cached
-    gate_log = torch.empty(T, 8, dtype=torch.float32, device=device)
-    beta = torch.empty(T, 8, dtype=torch.float32, device=device)
-    tensors = (gate_log, beta, gate_log.unsqueeze(0), beta.unsqueeze(0),
-               gate_log.data_ptr(), beta.data_ptr())
-    _gate_cache[key] = tensors
-    return tensors
-
-
-def _get_seq_output(T, device):
-    key = (T, device)
-    cached = _seq_output_cache.get(key)
-    if cached is not None:
-        return cached
-    t = torch.empty(T, 8, 128, dtype=torch.bfloat16, device=device)
-    _seq_output_cache[key] = t
-    return t
-
-
-def _get_seq_state(state):
-    key = (tuple(state.shape), state.dtype, state.device)
-    cached = _seq_state_cache.get(key)
-    if cached is not None:
-        return cached
-    t = torch.empty_like(state)
-    _seq_state_cache[key] = t
-    return t
-
-
 def run(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, scale):
-    _ensure_kernels()
+    global _cached_stream
+
+    if not _kernels:
+        kdir = _get_kernel_dir()
+        seq_src = (kdir / "sequential_kernel.cu").read_text()
+        seq_fns = compile_and_load(seq_src, ["gdn_prefill_sequential"])
+        _kernels["sequential"] = seq_fns["gdn_prefill_sequential"]
+        gate_src = (kdir / "fused_gate_kernel.cu").read_text()
+        gate_fns = compile_and_load(gate_src, ["fused_gate_kernel"])
+        _kernels["fused_gate"] = gate_fns["fused_gate_kernel"]
 
     T = q.shape[0]
     num_seqs = cu_seqlens.shape[0] - 1
-    stream = _get_stream()
+
+    stream = _cached_stream
+    if stream is None:
+        _cached_stream = drv.CUstream(torch.cuda.current_stream().cuda_stream)
+        stream = _cached_stream
 
     if scale is None or scale == 0.0:
         scale = _DEFAULT_SCALE
 
     if T <= THRESHOLD:
-        output = _get_seq_output(T, q.device)
-        new_state = _get_seq_state(state)
+        cached_out = _seq_output_cache.get(T)
+        if cached_out is not None:
+            output, output_ptr = cached_out
+        else:
+            output = torch.empty(T, 8, 128, dtype=torch.bfloat16, device=q.device)
+            output_ptr = _data_ptr(output)
+            _seq_output_cache[T] = (output, output_ptr)
+
+        cached_st = _seq_state_cache.get(num_seqs)
+        if cached_st is not None:
+            new_state, new_state_ptr = cached_st
+        else:
+            new_state = torch.empty_like(state)
+            new_state_ptr = _data_ptr(new_state)
+            _seq_state_cache[num_seqs] = (new_state, new_state_ptr)
 
         sa = _seq_args
-        sa.p0.value = q.data_ptr()
-        sa.p1.value = k.data_ptr()
-        sa.p2.value = v.data_ptr()
-        sa.p3.value = state.data_ptr()
-        sa.p4.value = A_log.data_ptr()
-        sa.p5.value = a.data_ptr()
-        sa.p6.value = dt_bias.data_ptr()
-        sa.p7.value = b.data_ptr()
-        sa.p8.value = cu_seqlens.data_ptr()
+        sa.p0.value = _data_ptr(q)
+        sa.p1.value = _data_ptr(k)
+        sa.p2.value = _data_ptr(v)
+        sa.p3.value = _data_ptr(state)
+        sa.p4.value = _data_ptr(A_log)
+        sa.p5.value = _data_ptr(a)
+        sa.p6.value = _data_ptr(dt_bias)
+        sa.p7.value = _data_ptr(b)
+        sa.p8.value = _data_ptr(cu_seqlens)
         sa.p9.value = scale
-        sa.p10.value = output.data_ptr()
-        sa.p11.value = new_state.data_ptr()
+        sa.p10.value = output_ptr
+        sa.p11.value = new_state_ptr
         sa.p12.value = num_seqs
 
         _cuLaunchKernel(
@@ -183,17 +160,28 @@ def run(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, scale):
             max_s_q = T
         else:
             n = num_seqs + 1
-            _cuMemcpyDtoH(_cu_seqlens_host_ptr, cu_seqlens.data_ptr(), n * 8)
+            _cuMemcpyDtoH(_cu_seqlens_host_ptr, _data_ptr(cu_seqlens), n * 8)
             h = _cu_seqlens_host
             max_s_q = max(h[i+1] - h[i] for i in range(num_seqs))
 
-        gate_log, beta, gate_log_4d, beta_4d, gate_log_ptr, beta_ptr = _get_gate_tensors(T, q.device)
+        cached_gate = _gate_cache.get(T)
+        if cached_gate is not None:
+            gate_log, beta, gate_log_4d, beta_4d, gate_log_ptr, beta_ptr = cached_gate
+        else:
+            gate_log = torch.empty(T, 8, dtype=torch.float32, device=q.device)
+            beta = torch.empty(T, 8, dtype=torch.float32, device=q.device)
+            gate_log_ptr = _data_ptr(gate_log)
+            beta_ptr = _data_ptr(beta)
+            cached_gate = (gate_log, beta, gate_log.unsqueeze(0), beta.unsqueeze(0),
+                           gate_log_ptr, beta_ptr)
+            _gate_cache[T] = cached_gate
+            gate_log, beta, gate_log_4d, beta_4d, gate_log_ptr, beta_ptr = cached_gate
 
         ga = _gate_args
-        ga.p0.value = A_log.data_ptr()
-        ga.p1.value = a.data_ptr()
-        ga.p2.value = dt_bias.data_ptr()
-        ga.p3.value = b.data_ptr()
+        ga.p0.value = _data_ptr(A_log)
+        ga.p1.value = _data_ptr(a)
+        ga.p2.value = _data_ptr(dt_bias)
+        ga.p3.value = _data_ptr(b)
         ga.p4.value = gate_log_ptr
         ga.p5.value = beta_ptr
         ga.p6.value = T
@@ -214,14 +202,14 @@ def run(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, scale):
         )
 
         compiled_gdn(
-            q.data_ptr(),
-            k.data_ptr(),
-            v.data_ptr(),
+            _data_ptr(q),
+            _data_ptr(k),
+            _data_ptr(v),
             output_ptr,
             gate_log_ptr,
             beta_ptr,
             problem_size,
-            state.data_ptr(),
+            _data_ptr(state),
             output_state_ptr,
             normalized_scale,
             cu_seqlens,

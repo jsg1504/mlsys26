@@ -42,7 +42,9 @@ def pack_solution(output_path: Path = None) -> Path:
     entry_point = build_config["entry_point"]
 
     # Determine source directory based on language
-    if language == "triton":
+    if language == "python":
+        source_dir = PROJECT_ROOT / "solution" / "python"
+    elif language == "triton":
         source_dir = PROJECT_ROOT / "solution" / "triton"
     elif language == "cuda":
         source_dir = PROJECT_ROOT / "solution" / "cuda"
@@ -54,10 +56,13 @@ def pack_solution(output_path: Path = None) -> Path:
 
     # Create build spec
     dps = build_config.get("destination_passing_style", True)
+    target_hardware = build_config.get("target_hardware", ["cuda"])
+    dependencies = build_config.get("dependencies", [])
     spec = BuildSpec(
         language=language,
-        target_hardware=["cuda"],
+        target_hardware=target_hardware,
         entry_point=entry_point,
+        dependencies=dependencies,
         destination_passing_style=dps,
     )
 
@@ -68,6 +73,7 @@ def pack_solution(output_path: Path = None) -> Path:
         name=solution_config["name"],
         definition=solution_config["definition"],
         author=solution_config["author"],
+        description=solution_config.get("description", ""),
     )
 
     # Write to output file

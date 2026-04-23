@@ -1,8 +1,12 @@
 [solution]
-name = "my-team-solution-v1"      # Solution name
-definition = "fused_moe"          # Track: fused_moe | sparse_attention | gated_delta_net
-author = "team-name"              # Team/author name
+name = "kjms_gdn_decode_cute_v1"
+definition = "gdn_decode_qk4_v8_d128_k_last"
+author = "kjms"
+description = "Standalone in-repo CuTe DSL GDN decode kernel derived from the Apache-licensed FlashInfer float32-state decode implementation, without depending on flashinfer runtime kernels."
 
 [build]
-language = "triton"               # triton | cuda
-entry_point = "kernel"            # Kernel function name
+language = "python"               # python | triton | cuda
+entry_point = "main.py::run"
+destination_passing_style = false
+dependencies = ["nvidia-cutlass-dsl", "cuda-python"]
+target_hardware = ["NVIDIA B200"]

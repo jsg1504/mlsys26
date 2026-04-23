@@ -27,7 +27,14 @@ TRACE_SET_PATH = "/data"
 
 image = (
     modal.Image.debian_slim(python_version="3.12")
-    .pip_install("flashinfer-bench", "torch", "triton", "numpy")
+    .pip_install(
+        "flashinfer-bench",
+        "torch",
+        "triton",
+        "numpy",
+        "nvidia-cutlass-dsl",
+        "cuda-python",
+    )
 )
 
 
@@ -35,7 +42,7 @@ image = (
 def run_benchmark(solution: Solution, config: BenchmarkConfig = None) -> dict:
     """Run benchmark on Modal B200 and return results."""
     if config is None:
-        config = BenchmarkConfig(warmup_runs=3, iterations=100, num_trials=5)
+        config = BenchmarkConfig(warmup_runs=1, iterations=3, num_trials=1)
 
     trace_set = TraceSet.from_path(TRACE_SET_PATH)
 
@@ -103,19 +110,39 @@ def print_results(results: dict):
 
 
 @app.local_entrypoint()
-def main():
+def main(
+    warmup_runs: int = 1,
+    iterations: int = 3,
+    num_trials: int = 1,
+    solution_json_path: str = "",
+):
     """Pack solution and run benchmark on Modal."""
-    from scripts.pack_solution import pack_solution
+    if solution_json_path:
+        solution_path = Path(solution_json_path)
+        print(f"Loading solution JSON from {solution_path}...")
+    else:
+        from scripts.pack_solution import pack_solution
 
-    print("Packing solution from source files...")
-    solution_path = pack_solution()
+        print("Packing solution from source files...")
+        solution_path = pack_solution()
 
     print("\nLoading solution...")
     solution = Solution.model_validate_json(solution_path.read_text())
     print(f"Loaded: {solution.name} ({solution.definition})")
 
     print("\nRunning benchmark on Modal B200...")
-    results = run_benchmark.remote(solution)
+    config = BenchmarkConfig(
+        warmup_runs=warmup_runs,
+        iterations=iterations,
+        num_trials=num_trials,
+    )
+    print(
+        "Benchmark config:"
+        f" warmup_runs={config.warmup_runs},"
+        f" iterations={config.iterations},"
+        f" num_trials={config.num_trials}"
+    )
+    results = run_benchmark.remote(solution, config)
 
     if not results:
         print("No results returned!")

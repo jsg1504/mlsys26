@@ -20,7 +20,7 @@ app = modal.App("flashinfer-bench")
 
 trace_volume = modal.Volume.from_name("flashinfer-trace", create_if_missing=True)
 TRACE_SET_PATH = "/data"
-DEFAULT_BENCHMARK_TIMEOUT_SECONDS = 300
+DEFAULT_BENCHMARK_TIMEOUT_SECONDS = 1800
 QUICK_BENCHMARK_TIMEOUT_SECONDS = 120
 QUICK_WORKLOAD_LIMIT = 3
 
@@ -40,7 +40,7 @@ image = (
 )
 
 
-@app.function(image=image, gpu="B200:1", timeout=3600, volumes={TRACE_SET_PATH: trace_volume})
+@app.function(image=image, gpu="B200:1", timeout=10800, volumes={TRACE_SET_PATH: trace_volume})
 def run_benchmark(solution: Solution, config: BenchmarkConfig = None, workload_limit: int | None = None) -> dict:
     """Run benchmark on Modal B200 and return results."""
     if config is None:
@@ -96,7 +96,12 @@ def run_benchmark(solution: Solution, config: BenchmarkConfig = None, workload_l
     return results
 
 
-def build_benchmark_config(quick: bool) -> BenchmarkConfig:
+def build_benchmark_config(
+    quick: bool,
+    warmup_runs: int | None = None,
+    iterations: int | None = None,
+    num_trials: int | None = None,
+) -> BenchmarkConfig:
     """Build the benchmark config for quick or full Modal runs."""
     if quick:
         return BenchmarkConfig(
@@ -107,9 +112,9 @@ def build_benchmark_config(quick: bool) -> BenchmarkConfig:
         )
 
     return BenchmarkConfig(
-        warmup_runs=1,
-        iterations=3,
-        num_trials=1,
+        warmup_runs=warmup_runs if warmup_runs is not None else 1,
+        iterations=iterations if iterations is not None else 5,
+        num_trials=num_trials if num_trials is not None else 3,
         timeout_seconds=DEFAULT_BENCHMARK_TIMEOUT_SECONDS,
     )
 
@@ -148,13 +153,23 @@ def print_results(results: dict):
 
 
 @app.local_entrypoint()
-def main(subfolder: str, quick: bool = True, limit: int = 0):
+def main(
+    subfolder: str,
+    quick: bool = True,
+    limit: int = 0,
+    warmup: int = 0,
+    iterations: int = 0,
+    trials: int = 0,
+):
     """Load pre-packed solution.json from subfolder and run benchmark on Modal.
 
     Args:
         subfolder: Which subfolder to benchmark (e.g. gdn_decode_qk4_v8_d128_k_last)
         quick: Use fast config for development (default). Pass --no-quick for final submission.
         limit: Max number of workloads to run. 0 means all workloads (default).
+        warmup: Warmup runs per iteration (0 = use default).
+        iterations: Iterations per trial (0 = use default).
+        trials: Number of trials (0 = use default).
     """
     import scripts.pack_solution as ps
 
@@ -167,7 +182,12 @@ def main(subfolder: str, quick: bool = True, limit: int = 0):
     solution = Solution.model_validate_json(solution_path.read_text())
     print(f"Loaded: {solution.name} ({solution.definition})")
 
-    config = build_benchmark_config(quick)
+    config = build_benchmark_config(
+        quick,
+        warmup_runs=warmup if warmup > 0 else None,
+        iterations=iterations if iterations > 0 else None,
+        num_trials=trials if trials > 0 else None,
+    )
     mode = "quick" if quick else "full"
     workload_limit = limit if limit > 0 else None
     workload_note = f", {workload_limit} workloads max" if workload_limit is not None else ""

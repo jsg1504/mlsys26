@@ -195,11 +195,11 @@ def run_ncu_profiling(solution_json: str, definition_name: str, workload_indices
                 script_path = f.name
 
             try:
-                # Focus on SpeedOfLight + LaunchStats + Occupancy
+                # Focus on SpeedOfLight only (user-requested section)
                 # Filter to our kernels only (not Activity Buffer etc)
                 ncu_cmd = [
                     ncu_bin,
-                    "--set", "detailed",
+                    "--section", "SpeedOfLight",
                     "--kernel-name", "regex:gdn_prefill_sequential|fused_gate_kernel|kernel_cutlass",
                     "--profile-from-start", "off",
                     "--target-processes", "all",
@@ -214,7 +214,7 @@ def run_ncu_profiling(solution_json: str, definition_name: str, workload_indices
                     env={**os.environ, "CUDA_VISIBLE_DEVICES": "0"},
                 )
                 if result.returncode == 0:
-                    output_lines.append(result.stdout[-5000:] if len(result.stdout) > 5000 else result.stdout)
+                    output_lines.append(result.stdout)
                 else:
                     output_lines.append(f"  ncu failed (rc={result.returncode})")
                     output_lines.append(f"  stderr: {result.stderr[:1000]}")

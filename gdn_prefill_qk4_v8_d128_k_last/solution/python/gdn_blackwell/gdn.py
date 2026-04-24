@@ -200,8 +200,10 @@ class GDN:
         mV_dkl: cute.Tensor,
         tma_atom_state_f32: Optional[cute.CopyAtom],
         mState_f32: Optional[cute.Tensor],
-        gate: cute.Tensor,
-        beta: cute.Tensor,
+        gate: cute.Tensor,          # fusion: now raw 'a' bf16 [T, H]
+        beta: cute.Tensor,          # fusion: now raw 'b' bf16 [T, H]
+        A_log_tensor: cute.Tensor,  # NEW: fp32 [H]
+        dt_bias_tensor: cute.Tensor,# NEW: fp32 [H]
         O: cute.Tensor,
         tma_atom_state_output: Optional[cute.CopyAtom],
         mStateOutput: Optional[cute.Tensor],
@@ -725,25 +727,44 @@ class GDN:
                     gate_vals = cute.make_rmem_tensor((4), cutlass.Float32)
                     beta_vals = cute.make_rmem_tensor((4), cutlass.Float32)
 
+                    # Fusion: compute per-head gate parameters once per work_tile.
+                    # gate_log = -exp(A_log[h]) * softplus(a + dt_bias[h])
+                    # beta_out = sigmoid(b) = 1/(1+exp(-b))
+                    A_log_val = cutlass.Float32(A_log_tensor[head_coord])
+                    dt_bias_val = cutlass.Float32(dt_bias_tensor[head_coord])
+                    neg_exp_A = -cute.math.exp(A_log_val)
+
                     for i in cutlass.range(loop_count, unroll=1):
-                        # step1: read gate beta
+                        # step1: read raw a/b, compute gate_log and sigmoid(b) inline
                         for it in cutlass.range_constexpr(4):
                             curr_idx = i * 128 + it * 32 + lane_id
                             if curr_idx < seqlen_q:
                                 if cutlass.const_expr(cum_seqlen_q is not None):
-                                    gate_vals[it] = gate[
+                                    a_raw_val = gate[
                                         batch_base + curr_idx, 0, (head_coord, 0)
                                     ]
-                                    beta_vals[it] = beta[
+                                    b_raw_val = beta[
                                         batch_base + curr_idx, 0, (head_coord, 0)
                                     ]
                                 else:
-                                    gate_vals[it] = gate[
+                                    a_raw_val = gate[
                                         curr_idx, 0, (head_coord, batch_coord)
                                     ]
-                                    beta_vals[it] = beta[
+                                    b_raw_val = beta[
                                         curr_idx, 0, (head_coord, batch_coord)
                                     ]
+                                a_f32 = cutlass.Float32(a_raw_val)
+                                b_f32 = cutlass.Float32(b_raw_val)
+                                x = a_f32 + dt_bias_val
+                                # softplus via log(1 + exp(x)); GDN workloads
+                                # keep x modest so overflow guard is unnecessary.
+                                sp = cute.math.log(
+                                    cutlass.Float32(1.0) + cute.math.exp(x)
+                                )
+                                gate_vals[it] = neg_exp_A * sp
+                                beta_vals[it] = cutlass.Float32(1.0) / (
+                                    cutlass.Float32(1.0) + cute.math.exp(-b_f32)
+                                )
                             else:
                                 gate_vals[it] = cutlass.Float32(0)
                                 beta_vals[it] = cutlass.Float32(0)
@@ -3719,8 +3740,10 @@ class GDN:
         k_iter: cute.Pointer,
         v_iter: cute.Pointer,
         o_iter: cute.Pointer,
-        g_iter: cute.Pointer,
-        beta_iter: cute.Pointer,
+        g_iter: cute.Pointer,      # semantics after fusion: raw 'a' tensor (bf16 [T, H])
+        beta_iter: cute.Pointer,   # semantics after fusion: raw 'b' tensor (bf16 [T, H])
+        A_log_iter: cute.Pointer,  # NEW: per-head fp32 [H]
+        dt_bias_iter: cute.Pointer,# NEW: per-head fp32 [H]
         problem_size: Tuple[
             cutlass.Int32,
             cutlass.Int32,
@@ -3794,8 +3817,13 @@ class GDN:
             (s_sum, 1, ((h_r, h_q), b_gb)),
             stride=(h_r * h_q, 0, ((1, h_r), stride_b_gb)),
         )
-        gate = cute.make_tensor(g_iter, gb_layout)
-        beta = cute.make_tensor(beta_iter, gb_layout)
+        # Fusion: g_iter/beta_iter now point to raw 'a'/'b' (bf16),
+        # and we build A_log, dt_bias tensors (fp32 [H]) for per-head gate params.
+        a_raw = cute.make_tensor(g_iter, gb_layout)
+        b_raw = cute.make_tensor(beta_iter, gb_layout)
+        head_layout = cute.make_layout(((h_r, h_q),), stride=((1, h_r),))
+        A_log_tensor = cute.make_tensor(A_log_iter, head_layout)
+        dt_bias_tensor = cute.make_tensor(dt_bias_iter, head_layout)
 
         if cutlass.const_expr(scale is None):
             scale = 1.0 / cute.math.sqrt(cutlass.Float32(d))
@@ -3805,8 +3833,12 @@ class GDN:
         self.k_dtype = k.element_type
         self.v_dtype = v.element_type
         self.o_dtype = o.element_type
-        self.g_dtype = gate.element_type
-        self.beta_dtype = beta.element_type
+        # smem dtype for sGate/sBeta stays fp32 (consumers expect fp32);
+        # only the raw global dtype changed to bf16.
+        self.g_dtype = cutlass.Float32
+        self.beta_dtype = cutlass.Float32
+        self.g_raw_dtype = a_raw.element_type
+        self.beta_raw_dtype = b_raw.element_type
 
         self.i_dtype = self.q_dtype
 
@@ -4346,8 +4378,10 @@ class GDN:
             tma_tensor_v,
             tma_atom_state_f32,
             tma_tensor_state_f32,
-            gate,
-            beta,
+            a_raw,
+            b_raw,
+            A_log_tensor,
+            dt_bias_tensor,
             o,
             tma_atom_state_output,
             tma_tensor_state_output,
@@ -4476,8 +4510,10 @@ def get_gdn_bundle(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    g: torch.Tensor,
-    beta: torch.Tensor,
+    a: torch.Tensor,          # fusion: raw bf16 [1, T, H]
+    b: torch.Tensor,          # fusion: raw bf16 [1, T, H]
+    A_log: torch.Tensor,      # NEW: fp32 [H]
+    dt_bias: torch.Tensor,    # NEW: fp32 [H]
     initial_state: torch.Tensor,
     cu_seqlens: torch.Tensor,
     num_seqs: int,
@@ -4520,6 +4556,8 @@ def get_gdn_bundle(
         q4 = q if q.dim() == 4 else q.unsqueeze(0)
         k4 = k if k.dim() == 4 else k.unsqueeze(0)
         v4 = v if v.dim() == 4 else v.unsqueeze(0)
+        a4 = a if a.dim() == 4 else (a if a.dim() == 3 else a.unsqueeze(0))
+        b4 = b if b.dim() == 4 else (b if b.dim() == 3 else b.unsqueeze(0))
 
         current_stream = _get_stream()
         gdn = GDN()
@@ -4527,8 +4565,10 @@ def get_gdn_bundle(
         k_tensor = from_dlpack(k4, assumed_align=16, enable_tvm_ffi=True)
         v_tensor = from_dlpack(v4, assumed_align=16, enable_tvm_ffi=True)
         o_tensor = from_dlpack(output, assumed_align=16, enable_tvm_ffi=True)
-        gate_tensor = from_dlpack(g, assumed_align=16, enable_tvm_ffi=True)
-        beta_tensor = from_dlpack(beta, assumed_align=16, enable_tvm_ffi=True)
+        a_tensor = from_dlpack(a4, assumed_align=16, enable_tvm_ffi=True)
+        b_tensor = from_dlpack(b4, assumed_align=16, enable_tvm_ffi=True)
+        A_log_tensor = from_dlpack(A_log, assumed_align=16, enable_tvm_ffi=True)
+        dt_bias_tensor = from_dlpack(dt_bias, assumed_align=16, enable_tvm_ffi=True)
         cu_seqlens_tensor = from_dlpack(cu_seqlens, assumed_align=16, enable_tvm_ffi=True)
         state_tensor = from_dlpack(initial_state, assumed_align=16, enable_tvm_ffi=True)
         state_output_tensor = from_dlpack(output_state, assumed_align=16, enable_tvm_ffi=True)
@@ -4540,8 +4580,10 @@ def get_gdn_bundle(
             k_tensor.iterator,
             v_tensor.iterator,
             o_tensor.iterator,
-            gate_tensor.iterator,
-            beta_tensor.iterator,
+            a_tensor.iterator,
+            b_tensor.iterator,
+            A_log_tensor.iterator,
+            dt_bias_tensor.iterator,
             problem_size,
             state_tensor.iterator,
             state_output_tensor.iterator,

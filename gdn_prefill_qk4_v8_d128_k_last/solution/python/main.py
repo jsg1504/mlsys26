@@ -1,7 +1,7 @@
 """GDN prefill entry point — hybrid dispatch.
 
 Short sequences: NVRTC register-cached sequential CUDA kernel (fused gates).
-Long sequences:  NVRTC fused gate kernel + CuTe-DSL chunked kernel.
+Long sequences:  CuTe-DSL chunked kernel (gates fused into gb_warp).
 """
 import ctypes
 from pathlib import Path
@@ -20,7 +20,6 @@ THRESHOLD = 192
 _DEFAULT_SCALE = 128 ** -0.5
 _kernels = {}
 _cached_stream = None
-_gate_cache = {}
 _seq_output_cache = {}
 _seq_state_cache = {}
 
@@ -71,26 +70,6 @@ class _SeqArgs:
 
 _seq_args = _SeqArgs()
 
-# Pre-allocated ctypes args for fused gate kernel (8 params)
-class _GateArgs:
-    __slots__ = ('p0','p1','p2','p3','p4','p5','p6','p7','arr')
-    def __init__(self):
-        self.p0 = _c_uint64(0)
-        self.p1 = _c_uint64(0)
-        self.p2 = _c_uint64(0)
-        self.p3 = _c_uint64(0)
-        self.p4 = _c_uint64(0)
-        self.p5 = _c_uint64(0)
-        self.p6 = _c_int32(0)
-        self.p7 = _c_int32(8)
-        self.arr = (_c_void_p * 8)(
-            _addressof(self.p0), _addressof(self.p1), _addressof(self.p2),
-            _addressof(self.p3), _addressof(self.p4), _addressof(self.p5),
-            _addressof(self.p6), _addressof(self.p7),
-        )
-
-_gate_args = _GateArgs()
-
 
 def run(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, scale):
     global _cached_stream
@@ -100,9 +79,6 @@ def run(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, scale):
         seq_src = (kdir / "sequential_kernel.cu").read_text()
         seq_fns = compile_and_load(seq_src, ["gdn_prefill_sequential"])
         _kernels["sequential"] = seq_fns["gdn_prefill_sequential"]
-        gate_src = (kdir / "fused_gate_kernel.cu").read_text()
-        gate_fns = compile_and_load(gate_src, ["fused_gate_kernel"])
-        _kernels["fused_gate"] = gate_fns["fused_gate_kernel"]
 
     T = q.shape[0]
     num_seqs = cu_seqlens.shape[0] - 1
@@ -164,40 +140,13 @@ def run(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, scale):
             h = _cu_seqlens_host
             max_s_q = max(h[i+1] - h[i] for i in range(num_seqs))
 
-        cached_gate = _gate_cache.get(T)
-        if cached_gate is not None:
-            gate_log, beta, gate_log_4d, beta_4d, gate_log_ptr, beta_ptr = cached_gate
-        else:
-            gate_log = torch.empty(T, 8, dtype=torch.float32, device=q.device)
-            beta = torch.empty(T, 8, dtype=torch.float32, device=q.device)
-            gate_log_ptr = _data_ptr(gate_log)
-            beta_ptr = _data_ptr(beta)
-            cached_gate = (gate_log, beta, gate_log.unsqueeze(0), beta.unsqueeze(0),
-                           gate_log_ptr, beta_ptr)
-            _gate_cache[T] = cached_gate
-            gate_log, beta, gate_log_4d, beta_4d, gate_log_ptr, beta_ptr = cached_gate
-
-        ga = _gate_args
-        ga.p0.value = _data_ptr(A_log)
-        ga.p1.value = _data_ptr(a)
-        ga.p2.value = _data_ptr(dt_bias)
-        ga.p3.value = _data_ptr(b)
-        ga.p4.value = gate_log_ptr
-        ga.p5.value = beta_ptr
-        ga.p6.value = T
-
-        _cuLaunchKernel(
-            _kernels["fused_gate"],
-            (T * 8 + 255) // 256, 1, 1,
-            256, 1, 1,
-            0, stream, ga.arr, 0,
-        )
+        # Fusion: skip fused_gate launch; CuTe-DSL kernel now computes gates inline.
 
         path_name = "small" if T <= 1024 and num_seqs <= 8 else "large"
 
         (compiled_gdn, output, output_state, problem_size, normalized_scale,
          output_3d, output_ptr, output_state_ptr) = get_gdn_bundle(
-            q, k, v, gate_log_4d, beta_4d, state, cu_seqlens,
+            q, k, v, a, b, A_log, dt_bias, state, cu_seqlens,
             num_seqs, T, max_s_q, path_name, scale,
         )
 
@@ -206,8 +155,10 @@ def run(q, k, v, state, A_log, a, dt_bias, b, cu_seqlens, scale):
             _data_ptr(k),
             _data_ptr(v),
             output_ptr,
-            gate_log_ptr,
-            beta_ptr,
+            _data_ptr(a),
+            _data_ptr(b),
+            _data_ptr(A_log),
+            _data_ptr(dt_bias),
             problem_size,
             _data_ptr(state),
             output_state_ptr,

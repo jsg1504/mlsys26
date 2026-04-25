@@ -58,13 +58,14 @@ __global__ void gdn_prefill_sequential(
     float scale,
     bf16_t* __restrict__ output,
     float* __restrict__ new_state,
-    int num_seqs
+    int num_seqs,
+    const int* __restrict__ seq_idx_map  // nullable: if non-null, remaps block seq index
 ) {
     // Block indexing: num_seqs * NUM_V_HEADS * V_QUARTERS blocks
     const int idx = blockIdx.x;
     const int v_quarter = idx % V_QUARTERS;
     const int vh = (idx / V_QUARTERS) % NUM_V_HEADS;
-    const int seq = idx / (NUM_V_HEADS * V_QUARTERS);
+    const int local_seq = idx / (NUM_V_HEADS * V_QUARTERS);
     const int qkh = vh / V_PER_Q;
 
     // Thread indexing within block
@@ -72,7 +73,12 @@ __global__ void gdn_prefill_sequential(
     const int vid = threadIdx.x / GROUP_SIZE;      // 0-15, V index within this eighth
     const int actual_vid = v_quarter * V_PER_BLOCK + vid;  // 0-127, global V index
 
-    if (seq >= num_seqs) return;
+    if (local_seq >= num_seqs) return;
+
+    // Hybrid dispatch: when seq_idx_map is non-null, the grid covers a subset
+    // of sequences (e.g. the "short" group), and each block's logical seq id
+    // must be remapped to the actual sequence index in cu_seqlens/state/output.
+    const int seq = (seq_idx_map != nullptr) ? seq_idx_map[local_seq] : local_seq;
 
     const long long seq_start = cu_seqlens[seq];
     const long long seq_end = cu_seqlens[seq + 1];

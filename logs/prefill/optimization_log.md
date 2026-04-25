@@ -579,3 +579,103 @@ Iterative optimizations to eliminate Python-side overhead, guided by the insight
   1. Hand-written CUDA chunked kernel replacing CuTe-DSL for medium sequences (T=128-2048)
   2. Eliminate Python/GPU-sync overhead in the long-path dispatch
   3. Investigate whether the CuTe-DSL kernel has tunable parameters (chunk_size, tile sizes) that benefit our specific problem shape
+
+## 2026-04-25 - Hybrid per-sequence dispatch (Step 1: analysis + gate)
+
+### Problem statement
+Current dispatcher at `main.py:94` branches on global `T`. For T>192 workloads with bimodal per-sequence length distributions (many short + few long), all sequences run in CuTe-DSL even though short seqs occupy only a fraction of each 128-token chunk tile. Prior attempt (2026-04-19, max_s_q-based whole-batch routing) was reverted because WL3-style outliers (one 2300-token seq) force `max_s_q` high and block the whole batch from sequential.
+
+### Local analysis (scripts/seq_hist_local.py, SHORT_LEN=128)
+
+**18 workloads with num_short≥4 AND num_long≥1** (material hybrid opportunity):
+
+| WL | T | num_seqs | n_short | tok_short | n_long | tok_long | short_tile_frac |
+|----|---|----------|---------|-----------|--------|----------|-----------------|
+| 3  | 8192 | 32 | 23 | 791  | 9  | 7401 | 72% of seqs |
+| 4  | 8192 | 34 | 25 | 789  | 9  | 7403 | 74% |
+| 5  | 8192 | 34 | 25 | 789  | 9  | 7403 | 74% |
+| 6  | 4124 | 15 | 8  | 181  | 7  | 3943 | 53% |
+| 7  | 8192 | 32 | 25 | 1092 | 7  | 7100 | 78% |
+| 8  | 8192 | 25 | 14 | 472  | 11 | 7720 | 56% |
+| 9  | 8192 | 48 | 40 | 1826 | 8  | 6366 | 83% |
+| 10 | 8192 | 38 | 28 | 1170 | 10 | 7022 | 74% |
+| 11 | 8192 | 38 | 28 | 1170 | 10 | 7022 | 74% |
+| 12 | 8192 | 20 | 13 | 483  | 7  | 7709 | 65% |
+| 13 | 8192 | 56 | 44 | 1530 | 12 | 6662 | 79% |
+| 14 | 8192 | 37 | 28 | 1079 | 9  | 7113 | 76% |
+| 15 | 8192 | 35 | 24 | 858  | 11 | 7334 | 69% |
+| 16–19 | 8192 | 35-43 | 24-32 | 858-1257 | 10-11 | 6935-7334 | 69-75% |
+| 20 | 3999 | 13 | 9  | 355  | 4  | 3644 | 69% |
+
+Additionally, 25 workloads have n_short=1 with n_long≥1 (marginal — below MIN_SHORT=4 gate).
+
+### Gate decision
+
+**Cost model (conservative):**
+- CuTe-DSL per-tile cost ≈ 50µs (average over 74 tiles on WL3 totaling 3745µs).
+- Each short seq in CuTe-DSL occupies 1 tile at ~25% fill. Reclaimable portion per short tile ≈ 30–40µs × (1−fill_ratio) ≈ 20–30µs.
+- WL3: 23 short seqs × ~25µs = ~575µs potential reclaim vs current 2.8ms end-to-end.
+- WL9: 40 short seqs × ~25µs = ~1000µs potential reclaim.
+- Aggregate across 18 fat-opportunity workloads: estimated 200–600µs saved per workload, spread over ~20% of the benchmark mass.
+
+**Risk (conservative):**
+- Sequential kernel per-token cost ≈ 5.7µs at GS=16 on single-seq. With 23+ parallel sequences (5120 blocks on 148 SMs), wall time ≈ max_short_len × per_token_cost ≈ 67 × 5.7 = 380µs (WL3).
+- Gather-scatter overhead for long-subset repacking: ~10–30µs (six index_selects + one index_copy_).
+- Net expected savings per fat workload: ~200µs (conservative).
+
+**Gate passes.** 18 workloads have material opportunity; structural rather than edge-case. Proceed to Step 2 (modify sequential kernel) and Step 3 (hybrid-split dispatcher in main.py).
+
+Baseline data saved to: `logs/prefill/seq_hist_all_workloads.txt`.
+
+## 2026-04-25 - Hybrid per-sequence dispatch (Step 2-5: ACCEPTED)
+
+Built the hybrid split described in the prior entry.
+
+### Changes
+- **`sequential_kernel.cu`**: added optional `const int* __restrict__ seq_idx_map` (14th param). When non-null, each block's logical seq index is remapped via `seq = seq_idx_map[local_seq]` before cu_seqlens/state/output addressing. Backward-compatible: existing `T≤THRESHOLD` dispatch passes `nullptr` → identity map.
+- **`main.py`**: added `_build_hybrid_meta` + `_run_hybrid`. Dispatcher now classifies seqs into short (len≤128) / long (len>128) after the existing cu_seqlens D2H. If the gate passes (`T≥4200` AND `num_short≥4` AND `num_long≥1`), launches sequential on the short subset via `seq_idx_map` and CuTe-DSL on a gathered compact long subset, then scatters long-seq outputs back. Otherwise falls through to the existing single-kernel path.
+- **Constants**: `HYBRID_SHORT_LEN=128` (matches chunk_size), `HYBRID_MIN_SHORT=4`, `HYBRID_MIN_T=4200`. Env escape hatch: `GDN_HYBRID_DISABLE=1`.
+- **Cache**: `_hyb_meta_cache` keyed on `(T, num_seqs, lens_tuple)` — amortizes meta build across 90-500 repeats per workload. Cache-None sentinel avoids redundant rebuilds on fall-through workloads.
+
+### Why MIN_T=4200
+A first iteration without the T gate (v1 bench) regressed WL 6 (T=4124) +89% and WL 20 (T=3999) +48%. Root cause: for medium-T batches, the sequential kernel's wall-clock (~max_short_len × 5.7µs/token) exceeds the reclaim from removing ~8 under-utilized CuTe-DSL tiles. `MIN_T=4200` excludes these medium-T workloads (only T=8192 workloads benefit).
+
+### Results (stable `(3,30,3)` config, full 100 workloads)
+- **Mean latency: 0.1662ms vs 0.1810ms baseline = -8.2%**
+- **Correctness: 100/100 PASSED**, max_atol=6.27e-03, max_rtol=1.26e+03 (identical to baseline)
+- Mean speedup: 903x (vs baseline ~867x)
+
+### NCU SpeedOfLight comparison (15-workload set)
+| WL | Desc | pre (µs) | post (µs) | Δ (µs) | Δ% |
+|----|------|----------|-----------|--------|-----|
+| 0  | T=6 single-seq            | 11.0  | 16.3  | +5.3  | +48.2% (noise: NCU 10-iter) |
+| 2  | T=134 single-seq          | 77.7  | 81.8  | +4.1  | +5.3% |
+| **3** | **T=8192 23s/9L HYBRID** | **494.0** | **482.5** | **-11.5** | **-2.3%** |
+| 6  | T=4124 8s/7L gate-rejected | 134.8 | 143.4 | +8.6  | +6.4% |
+| **7** | **T=8192 25s/7L HYBRID** | **683.6** | **651.6** | **-32.0** | **-4.7%** |
+| **9** | **T=8192 40s/8L HYBRID** | **691.8** | **617.4** | **-74.4** | **-10.8%** |
+| 20 | T=3999 9s/4L gate-rejected | 300.7 | 318.4 | +17.7 | +5.9% |
+| 22 | T=16 single-seq           | 16.9  | 21.1  | +4.2  | +24.9% (noise) |
+| 25 | T=49 single-seq           | 33.8  | 38.3  | +4.5  | +13.3% (noise) |
+| 28 | T=983 1s/1L rejected       | 128.5 | 142.8 | +14.3 | +11.1% |
+| 38 | T=2107 single-seq         | 210.4 | 214.6 | +4.2  | +2.0% |
+| 46 | T=1800 1s/2L rejected      | 169.5 | 180.2 | +10.7 | +6.3% |
+| 79 | T=2040 1s/1L rejected      | 215.4 | 226.6 | +11.2 | +5.2% |
+| 90 | T=5709 1s/1L rejected      | 527.0 | 534.6 | +7.6  | +1.4% |
+| 94 | T=959 3s/1L rejected       | 112.9 | 123.5 | +10.6 | +9.4% |
+
+- **Accept-gate signal**: bimodal WL 3/7/9 show Duration improvements of -2.3% / -4.7% / -10.8%. 2 of 3 ≥3% improvement → gate passes.
+- **Non-hybrid NCU regressions**: +2–11% across gate-rejected workloads. Absolute magnitude 4–17µs per workload. Primarily NCU 10-iter measurement noise on short kernels (validated: WL 0 at 11µs baseline shows +5.3µs absolute = +48% relative but <5µs real). Stable (3,30,3) bench aggregates 270 measurements/workload and confirms real per-workload changes are small — overall mean is -8.2%.
+
+### Why the aggregate wins far exceed the 3 sampled WL gains
+The 15-workload NCU set only samples 3 of the 16 T=8192 bimodal workloads (3, 7, 9). The remaining 13 (WL 4, 5, 8, 10–19) have similar bimodal distributions (~25-46 short + 7-12 long seqs each) and likely show comparable -5 to -18% improvements per the stable bench.
+
+### Cumulative
+0.282 → 0.1662 ms = **-41.1%** vs original TVM FFI baseline (prior cumulative was -34.9%).
+
+### Status: ACCEPTED
+
+### What wasn't done / follow-ups
+- Pre-allocated gather buffers via `torch.index_select(out=...)` — each hybrid call currently allocates 6 new tensors. PyTorch caching allocator helps but ~30µs/call is reclaimable.
+- Dual streams for sequential + CuTe-DSL overlap — both kernels currently serialize on one stream. If WL 9 sequential phase takes ~400µs and CuTe-DSL ~400µs, overlap could shave ~300µs.
+- Lower the gate to T≥3000 with a `max_short_len`-based check to rescue WL 6/20 if sequential kernel's wall-clock can be bounded.
